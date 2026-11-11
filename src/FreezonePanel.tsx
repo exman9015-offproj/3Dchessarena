@@ -17,10 +17,27 @@ type FreezoneRoom = {
 export type FreezonePattern = {
   id: string;
   name: string;
+  title: string;
+  catchphrase: string;
   type: PieceType;
   moves: MoveOffset[];
   jumps: MoveOffset[];
   slide: boolean;
+};
+
+type FreezoneOwnedPiece = {
+  id: string;
+  name: string;
+  title: string;
+  catchphrase: string;
+  type: PieceType | 'king';
+};
+
+type FreezoneOrbEffect = {
+  type: 'xp' | 'red' | 'yellow' | 'purple' | 'white';
+  label: string;
+  description: string;
+  color: string;
 };
 
 type FreezoneHud = {
@@ -28,9 +45,17 @@ type FreezoneHud = {
   isPlayer: boolean;
   xp: number;
   xpCost: number;
+  xpProgress: number;
   capacity: number;
   maxCapacity: number;
   pieces: number;
+  movesPerCycle: number;
+  cooldownDurationMs: number;
+  editorRange: number;
+  maxPatternOffsets: number;
+  upgradeLevels: { red: number; yellow: number; purple: number; white: number };
+  ownedPieces: FreezoneOwnedPiece[];
+  orbEffects: FreezoneOrbEffect[];
   movesUsed: number;
   cooldownMs: number;
   boardSize: number;
@@ -39,6 +64,7 @@ type FreezoneHud = {
 };
 
 type FreezoneApiResult = { ok: boolean; code?: string; error?: string };
+type FreezonePatternInput = Omit<FreezonePattern, 'id'> | FreezonePattern;
 
 const PIECE_TYPES: { type: PieceType; label: string }[] = [
   { type: 'pawn', label: 'Pawn' },
@@ -62,6 +88,7 @@ export default function FreezonePanel() {
   const [hud, setHud] = useState<FreezoneHud | null>(null);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [roomCode, setRoomCode] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [status, setStatus] = useState('');
@@ -71,6 +98,9 @@ export default function FreezonePanel() {
   const [designMode, setDesignMode] = useState(false);
   const [pieceType, setPieceType] = useState<PieceType>('knight');
   const [pieceName, setPieceName] = useState('');
+  const [pieceTitle, setPieceTitle] = useState('');
+  const [pieceCatchphrase, setPieceCatchphrase] = useState('');
+  const [pendingReplacement, setPendingReplacement] = useState<FreezonePatternInput | null>(null);
   const [selectedMoves, setSelectedMoves] = useState<MoveOffset[]>([]);
   const [selectedJumps, setSelectedJumps] = useState<MoveOffset[]>([]);
   const [slide, setSlide] = useState(false);
@@ -101,27 +131,47 @@ export default function FreezonePanel() {
   useEffect(() => {
     if (!open || hud) return;
     let active = true;
+    let refreshing = false;
+    let mainRoomEnsured = false;
     const refreshRooms = async (ensureMain = false) => {
+      if (refreshing) return;
+      refreshing = true;
       const api = window.wizardChess;
       if (!api?.listFreezoneRooms) {
-        if (active && ensureMain) setRoomsLoading(false);
+        if (active) {
+          setStatus('Freezone is still starting. Try again in a moment.');
+          if (ensureMain) setRoomsLoading(false);
+        }
+        refreshing = false;
         return;
       }
       try {
-        if (ensureMain) await api.ensureFreezoneMainRoom?.();
+        if (!mainRoomEnsured && api.ensureFreezoneMainRoom) {
+          await api.ensureFreezoneMainRoom();
+          mainRoomEnsured = true;
+        }
         const nextRooms = await api.listFreezoneRooms();
-        if (active) setRooms(nextRooms);
+        if (active) {
+          setRooms(nextRooms);
+          setStatus((current) =>
+            current === 'Freezone is still starting. Try again in a moment.' ? '' : current
+          );
+        }
       } catch (error) {
         if (active) setStatus(error instanceof Error ? error.message : 'Could not load Freezone rooms.');
       } finally {
         if (active && ensureMain) setRoomsLoading(false);
+        refreshing = false;
       }
     };
+    const handleApiReady = () => void refreshRooms(true);
+    window.addEventListener('wizard-chess-api-ready', handleApiReady);
     setRoomsLoading(true);
     void refreshRooms(true);
     const timer = window.setInterval(() => void refreshRooms(), 8000);
     return () => {
       active = false;
+      window.removeEventListener('wizard-chess-api-ready', handleApiReady);
       window.clearInterval(timer);
     };
   }, [open, hud]);
@@ -193,22 +243,43 @@ export default function FreezonePanel() {
     }
   };
 
-  const acquirePiece = (pattern: Omit<FreezonePattern, 'id'> | FreezonePattern) => {
+  const acquirePiece = async (pattern: FreezonePatternInput, replacementId = '') => {
     const action = window.wizardChess?.buyFreezonePiece;
     if (!action) {
       setStatus('Freezone is still starting. Try again in a moment.');
       return;
     }
-    const result = action(pattern);
-    setStatus(result.ok
-      ? `${pattern.name} acquired. It has joined your army.`
-      : result.error || 'Could not acquire this piece.');
+    if (hud && hud.pieces >= hud.capacity && !replacementId) {
+      setPendingReplacement(pattern);
+      setStatus(`Army full. Choose a piece to replace; this costs ${hud.xpCost} XP.`);
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(pattern, replacementId);
+      if (result.ok) {
+        setPendingReplacement(null);
+        setStatus(replacementId
+          ? `${pattern.name} acquired; the selected piece was replaced.`
+          : `${pattern.name} acquired. It has joined your army.`);
+      } else {
+        setStatus(result.error || 'Could not acquire this piece.');
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not acquire this piece.');
+    } finally {
+      setPurchaseBusy(false);
+    }
   };
 
   const toggleMove = (row: number, col: number) => {
     const exists = selectedMoves.some(([r, c]) => r === row && c === col);
     const isJump = selectedJumps.some(([r, c]) => r === row && c === col);
     if (!exists) {
+      if (selectedMoves.length >= (hud?.maxPatternOffsets || 48)) {
+        setStatus(`A pattern can have at most ${hud?.maxPatternOffsets || 48} offsets.`);
+        return;
+      }
       setSelectedMoves((current) => [...current, [row, col]]);
       return;
     }
@@ -233,9 +304,10 @@ export default function FreezonePanel() {
     }
   };
 
-  const canAcquire = Boolean(hud?.isPlayer && hud.xp >= hud.xpCost &&
-    (hud.pieces < hud.capacity || hud.capacity < hud.maxCapacity));
+  const canAcquire = Boolean(hud?.isPlayer && hud.xp >= hud.xpCost);
   const previewName = pieceName.trim() || `Custom ${pieceType}`;
+  const editorRange = hud?.editorRange || 3;
+  const editorDiameter = editorRange * 2 + 1;
 
   return (
     <>
@@ -283,8 +355,8 @@ export default function FreezonePanel() {
           {hud ? (
             <>
               <p className="freezone-description">
-                Collect glowing XP orbs by moving onto them. Spend XP to add a piece; your army
-                capacity grows with purchases up to {hud.maxCapacity}.
+                Collect the colored orbs by landing on their tile. Piece purchases cost {hud.xpCost} XP.
+                Purple orbs expand your army; when it is full, select a piece to replace.
               </p>
               <div className="freezone-summary">
                 <span><strong>{hud.xp}</strong> XP</span>
@@ -294,15 +366,50 @@ export default function FreezonePanel() {
                   <strong>
                     {hud.cooldownMs > 0
                       ? `${Math.ceil(hud.cooldownMs / 1000)}s`
-                      : `${Math.max(0, 2 - hud.movesUsed)}/2`}
+                      : `${Math.max(0, hud.movesPerCycle - hud.movesUsed)}/${hud.movesPerCycle}`}
                   </strong>
-                  {hud.cooldownMs > 0 ? ' move cooldown' : ' moves ready'}
+                  {hud.cooldownMs > 0 ? ' resting' : ' moves left'}
                 </span>
+                <span><strong>{(hud.cooldownDurationMs / 1000).toFixed(1)}s</strong> cooldown</span>
+                <span><strong>±{hud.editorRange}</strong> editor reach</span>
                 {roomCode && (
                   <button type="button" onClick={() => void copyRoomCode()}>
                     Arena {roomCode} · Copy
                   </button>
                 )}
+              </div>
+              <div
+                className="freezone-xp-progress"
+                role="progressbar"
+                aria-label="Progress toward the next piece purchase"
+                aria-valuemin={0}
+                aria-valuemax={hud.xpCost}
+                aria-valuenow={hud.xpProgress}
+              >
+                <span style={{ width: `${(hud.xpProgress / hud.xpCost) * 100}%` }} />
+              </div>
+              <p className="freezone-hint">
+                {hud.xpProgress}/{hud.xpCost} XP toward the next piece · {hud.movesPerCycle} moves per cycle
+              </p>
+              <p className="freezone-hint">
+                Upgrade levels: Red {hud.upgradeLevels.red} · Yellow {hud.upgradeLevels.yellow} ·
+                Purple {hud.upgradeLevels.purple} · White {hud.upgradeLevels.white}
+              </p>
+              {!hud.isPlayer ? (
+                <p className="freezone-hint">Spectators cannot buy or upgrade pieces.</p>
+              ) : hud.xp < hud.xpCost ? (
+                <p className="freezone-hint">Collect {hud.xpCost - hud.xp} more XP to buy a piece.</p>
+              ) : hud.pieces >= hud.capacity ? (
+                <p className="freezone-hint">Army full: choose a non-king piece to replace or collect a purple orb.</p>
+              ) : null}
+              <div className="freezone-orb-guide" aria-label="Orb effects">
+                {hud.orbEffects.map((orb) => (
+                  <span key={orb.type}>
+                    <i style={{ backgroundColor: orb.color }} />
+                    <strong>{orb.label}</strong> {orb.description}
+                    {orb.type !== 'xp' && <small>Lv {hud.upgradeLevels[orb.type]}</small>}
+                  </span>
+                ))}
               </div>
               <div className="freezone-tabs" role="tablist" aria-label="Piece options">
                 <button
@@ -323,20 +430,45 @@ export default function FreezonePanel() {
                 </button>
               </div>
 
+              {pendingReplacement && (
+                <div className="freezone-replacement">
+                  <p>
+                    Choose a non-king piece to replace with {pendingReplacement.name}.
+                    The purchase costs {hud.xpCost} XP.
+                  </p>
+                  {hud.ownedPieces.map((piece) => (
+                    <button
+                      type="button"
+                      key={piece.id}
+                      disabled={purchaseBusy || piece.type === 'king'}
+                      onClick={() => void acquirePiece(pendingReplacement, piece.id)}
+                    >
+                      Replace {piece.name}{piece.title ? ` · ${piece.title}` : ''}
+                      {piece.type === 'king' ? ' · King cannot be replaced' : ''}
+                    </button>
+                  ))}
+                  <button type="button" onClick={() => setPendingReplacement(null)}>
+                    Cancel
+                  </button>
+                </div>
+              )}
+
               {!designMode ? (
                 <div className="freezone-pattern-list">
                   {hud.pieceOptions.map((pattern) => (
                     <article className="freezone-pattern" key={pattern.id}>
                       <div>
                         <strong>{pattern.name}</strong>
+                        {pattern.title && <span>{pattern.title}</span>}
+                        {pattern.catchphrase && <span>“{pattern.catchphrase}”</span>}
                         <span>{movementText(pattern.moves, pattern.jumps, pattern.slide)}</span>
                       </div>
                       <button
                         type="button"
-                        disabled={!canAcquire}
-                        onClick={() => acquirePiece(pattern)}
+                        disabled={!canAcquire || purchaseBusy}
+                        onClick={() => void acquirePiece(pattern)}
                       >
-                        Acquire · {hud.xpCost} XP
+                        {hud.pieces >= hud.capacity ? 'Replace' : 'Acquire'} · {hud.xpCost} XP
                       </button>
                     </article>
                   ))}
@@ -364,16 +496,39 @@ export default function FreezonePanel() {
                         onChange={(event) => setPieceName(event.target.value)}
                       />
                     </label>
+                    <label>
+                      Role / title
+                      <input
+                        value={pieceTitle}
+                        maxLength={32}
+                        placeholder="General"
+                        onChange={(event) => setPieceTitle(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Catchphrase
+                      <input
+                        value={pieceCatchphrase}
+                        maxLength={120}
+                        placeholder="Always defeats my opponents"
+                        onChange={(event) => setPieceCatchphrase(event.target.value)}
+                      />
+                    </label>
                   </div>
                   <p className="freezone-hint">
-                    Select squares around the center to draw reachable offsets such as an L or W.
+                    Editor reach: up to ±{editorRange} tiles in each direction. This does not change the physical board size.
                   </p>
-                  <div className="freezone-preview-board" role="group" aria-label="Movement pattern preview">
-                    {Array.from({ length: 49 }, (_, index) => {
-                      const row = Math.floor(index / 7);
-                      const col = index % 7;
-                      const offsetRow = 3 - row;
-                      const offsetCol = col - 3;
+                  <div
+                    className="freezone-preview-board"
+                    role="group"
+                    aria-label="Movement pattern preview"
+                    style={{ gridTemplateColumns: `repeat(${editorDiameter}, minmax(0, 1fr))` }}
+                  >
+                    {Array.from({ length: editorDiameter * editorDiameter }, (_, index) => {
+                      const row = Math.floor(index / editorDiameter);
+                      const col = index % editorDiameter;
+                      const offsetRow = editorRange - row;
+                      const offsetCol = col - editorRange;
                       const center = offsetRow === 0 && offsetCol === 0;
                       const selected = selectedMoves.some(
                         ([moveRow, moveCol]) => moveRow === offsetRow && moveCol === offsetCol
@@ -415,16 +570,18 @@ export default function FreezonePanel() {
                   <button
                     type="button"
                     className="freezone-design-acquire"
-                    disabled={!canAcquire || selectedMoves.length === 0}
-                    onClick={() => acquirePiece({
+                    disabled={!canAcquire || purchaseBusy || selectedMoves.length === 0}
+                    onClick={() => void acquirePiece({
                       name: previewName,
+                      title: pieceTitle.trim(),
+                      catchphrase: pieceCatchphrase.trim(),
                       type: pieceType,
                       moves: selectedMoves,
                       jumps: selectedJumps,
                       slide
                     })}
                   >
-                    Design &amp; acquire · {hud.xpCost} XP
+                    {hud.pieces >= hud.capacity ? 'Design & replace' : 'Design & acquire'} · {hud.xpCost} XP
                   </button>
                 </div>
               )}

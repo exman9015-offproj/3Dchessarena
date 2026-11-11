@@ -26,8 +26,9 @@ type MultiplayerApi = {
   ensureFreezoneMainRoom?: () => Promise<CreatorRoom & { kind: string; isMainArena: boolean }>;
   listCustomRooms?: () => Promise<CreatorRoom[]>;
   buyFreezonePiece?: (
-    pattern: Omit<FreezonePattern, 'id'> | FreezonePattern
-  ) => { ok: boolean; error?: string };
+    pattern: Omit<FreezonePattern, 'id'> | FreezonePattern,
+    replacementId?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
 };
 
 declare global {
