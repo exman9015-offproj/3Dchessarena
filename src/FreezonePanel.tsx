@@ -39,6 +39,7 @@ type FreezoneOrbEffect = {
   description: string;
   color: string;
 };
+type FreezoneUpgrade = Exclude<FreezoneOrbEffect['type'], 'xp'>;
 
 type FreezoneHud = {
   enabled: boolean;
@@ -54,6 +55,8 @@ type FreezoneHud = {
   editorRange: number;
   maxPatternOffsets: number;
   upgradeLevels: { red: number; yellow: number; purple: number; white: number };
+  orbBalances: Record<FreezoneOrbEffect['type'], number>;
+  canUpgrade: Record<FreezoneUpgrade, boolean>;
   ownedPieces: FreezoneOwnedPiece[];
   orbEffects: FreezoneOrbEffect[];
   movesUsed: number;
@@ -72,6 +75,12 @@ const PIECE_TYPES: { type: PieceType; label: string }[] = [
   { type: 'knight', label: 'Knight' },
   { type: 'bishop', label: 'Bishop' },
   { type: 'queen', label: 'Queen' }
+];
+const FREEZONE_UPGRADES: { type: FreezoneUpgrade; label: string; description: string }[] = [
+  { type: 'red', label: 'Move budget', description: '+1 action before resting' },
+  { type: 'yellow', label: 'Cooldown', description: 'Reduce rest by 0.3 seconds' },
+  { type: 'purple', label: 'Army capacity', description: '+1 piece slot' },
+  { type: 'white', label: 'Editor reach', description: '+1 tile of movement-design range' }
 ];
 
 function movementText(moves: MoveOffset[], jumps: MoveOffset[], slide: boolean) {
@@ -272,6 +281,25 @@ export default function FreezonePanel() {
     }
   };
 
+  const purchaseUpgrade = async (type: FreezoneUpgrade) => {
+    const action = window.wizardChess?.upgradeFreezoneSkill;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(type);
+      setStatus(result.ok
+        ? `${FREEZONE_UPGRADES.find((upgrade) => upgrade.type === type)?.label} upgraded.`
+        : result.error || 'Could not purchase this upgrade.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not purchase this upgrade.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  };
+
   const toggleMove = (row: number, col: number) => {
     const exists = selectedMoves.some(([r, c]) => r === row && c === col);
     const isJump = selectedJumps.some(([r, c]) => r === row && c === col);
@@ -355,8 +383,8 @@ export default function FreezonePanel() {
           {hud ? (
             <>
               <p className="freezone-description">
-                Collect the colored orbs by landing on their tile. Piece purchases cost {hud.xpCost} XP.
-                Purple orbs expand your army; when it is full, select a piece to replace.
+                Landing on an orb stores that resource; pickups never change your skills automatically.
+                Spend XP to acquire a piece, or click an upgrade below to spend one matching colored orb.
               </p>
               <div className="freezone-summary">
                 <span><strong>{hud.xp}</strong> XP</span>
@@ -368,7 +396,7 @@ export default function FreezonePanel() {
                       ? `${Math.ceil(hud.cooldownMs / 1000)}s`
                       : `${Math.max(0, hud.movesPerCycle - hud.movesUsed)}/${hud.movesPerCycle}`}
                   </strong>
-                  {hud.cooldownMs > 0 ? ' resting' : ' moves left'}
+                  {hud.cooldownMs > 0 ? ' resting' : ' actions left'}
                 </span>
                 <span><strong>{(hud.cooldownDurationMs / 1000).toFixed(1)}s</strong> cooldown</span>
                 <span><strong>±{hud.editorRange}</strong> editor reach</span>
@@ -389,7 +417,7 @@ export default function FreezonePanel() {
                 <span style={{ width: `${(hud.xpProgress / hud.xpCost) * 100}%` }} />
               </div>
               <p className="freezone-hint">
-                {hud.xpProgress}/{hud.xpCost} XP toward the next piece · {hud.movesPerCycle} moves per cycle
+                {hud.xpProgress}/{hud.xpCost} XP toward the next piece · {hud.movesPerCycle} actions per cycle
               </p>
               <p className="freezone-hint">
                 Upgrade levels: Red {hud.upgradeLevels.red} · Yellow {hud.upgradeLevels.yellow} ·
@@ -400,15 +428,37 @@ export default function FreezonePanel() {
               ) : hud.xp < hud.xpCost ? (
                 <p className="freezone-hint">Collect {hud.xpCost - hud.xp} more XP to buy a piece.</p>
               ) : hud.pieces >= hud.capacity ? (
-                <p className="freezone-hint">Army full: choose a non-king piece to replace or collect a purple orb.</p>
+                <p className="freezone-hint">Army full: choose a non-king piece to replace or buy an army-capacity upgrade with a purple orb.</p>
               ) : null}
               <div className="freezone-orb-guide" aria-label="Orb effects">
                 {hud.orbEffects.map((orb) => (
                   <span key={orb.type}>
                     <i style={{ backgroundColor: orb.color }} />
                     <strong>{orb.label}</strong> {orb.description}
-                    {orb.type !== 'xp' && <small>Lv {hud.upgradeLevels[orb.type]}</small>}
+                    <small>
+                      Balance: {hud.orbBalances[orb.type]}
+                      {orb.type !== 'xp' && ` · Lv ${hud.upgradeLevels[orb.type]}`}
+                    </small>
                   </span>
+                ))}
+              </div>
+              <div className="freezone-upgrades" aria-label="Explicit skill upgrades">
+                <h3>Spend an orb to upgrade</h3>
+                {FREEZONE_UPGRADES.map((upgrade) => (
+                  <div className="freezone-upgrade" key={upgrade.type}>
+                    <span>
+                      <strong>{upgrade.label}</strong>
+                      <small>{upgrade.description} · {hud.orbBalances[upgrade.type]} available</small>
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!hud.isPlayer || purchaseBusy || !hud.canUpgrade[upgrade.type] ||
+                        hud.orbBalances[upgrade.type] < 1}
+                      onClick={() => void purchaseUpgrade(upgrade.type)}
+                    >
+                      {hud.canUpgrade[upgrade.type] ? 'Spend 1 orb' : 'Max level'}
+                    </button>
+                  </div>
                 ))}
               </div>
               <div className="freezone-tabs" role="tablist" aria-label="Piece options">

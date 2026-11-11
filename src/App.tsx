@@ -13,6 +13,7 @@ type CreatorRoom = {
   joined: number;
   capacity: number;
 };
+type FreezoneUpgrade = 'red' | 'yellow' | 'purple' | 'white';
 type MultiplayerAction = () => Promise<MultiplayerResult> | undefined;
 type MultiplayerApi = {
   createMultiplayerRoom?: (color: 'w' | 'b') => Promise<MultiplayerResult>;
@@ -29,6 +30,7 @@ type MultiplayerApi = {
     pattern: Omit<FreezonePattern, 'id'> | FreezonePattern,
     replacementId?: string
   ) => Promise<{ ok: boolean; error?: string }>;
+  upgradeFreezoneSkill?: (type: FreezoneUpgrade) => Promise<{ ok: boolean; error?: string }>;
 };
 
 declare global {
