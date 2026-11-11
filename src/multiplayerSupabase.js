@@ -1,3 +1,5 @@
+import { mergeFreezoneRoomState } from './freezoneCustomization.js';
+
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
@@ -352,58 +354,6 @@ export async function saveFreeModeState(code, state) {
     })
     .eq('id', room.id);
   throwIfError(error);
-}
-
-function mergeFreezoneRoomState(baseState, localState, currentState) {
-  const base = baseState || {};
-  const current = currentState || {};
-  const basePieces = new Map((base.pieces || []).map((piece) => [piece.id, piece]));
-  const localPieces = new Map((localState.pieces || []).map((piece) => [piece.id, piece]));
-  const mergedPieces = new Map((current.pieces || []).map((piece) => [piece.id, piece]));
-
-  for (const id of basePieces.keys()) {
-    if (!localPieces.has(id)) mergedPieces.delete(id);
-  }
-  for (const [id, piece] of localPieces) {
-    if (JSON.stringify(basePieces.get(id)) !== JSON.stringify(piece)) mergedPieces.set(id, piece);
-  }
-
-  const baseOrbs = new Map((base.xpOrbs || []).map((orb) => [orb.id, orb]));
-  const localOrbs = new Map((localState.xpOrbs || []).map((orb) => [orb.id, orb]));
-  const mergedOrbs = new Map((current.xpOrbs || []).map((orb) => [orb.id, orb]));
-  for (const id of baseOrbs.keys()) {
-    if (!localOrbs.has(id)) mergedOrbs.delete(id);
-  }
-  for (const [id, orb] of localOrbs) {
-    if (JSON.stringify(baseOrbs.get(id)) !== JSON.stringify(orb)) mergedOrbs.set(id, orb);
-  }
-
-  const players = { ...(current.freezonePlayers || {}) };
-  for (const [side, player] of Object.entries(localState.freezonePlayers || {})) {
-    if (JSON.stringify(base.freezonePlayers?.[side]) !== JSON.stringify(player)) {
-      players[side] = player;
-    }
-  }
-
-  const occupied = new Set(
-    Array.from(mergedPieces.values(), (piece) => `${piece.r},${piece.c}`)
-  );
-  const orbCells = new Set();
-  const xpOrbs = Array.from(mergedOrbs.values()).filter((orb) => {
-    const key = `${orb.r},${orb.c}`;
-    if (occupied.has(key) || orbCells.has(key)) return false;
-    orbCells.add(key);
-    return true;
-  });
-
-  return {
-    ...current,
-    ...localState,
-    seats: current.seats || localState.seats || [],
-    freezonePlayers: players,
-    pieces: Array.from(mergedPieces.values()),
-    xpOrbs
-  };
 }
 
 export async function saveFreezoneState(code, state, baseState) {

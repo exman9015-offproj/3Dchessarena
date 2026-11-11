@@ -1839,6 +1839,214 @@ body.cinematic-ui-hidden #hud-bottom {
   margin-top: 18px;
 }
 
+.freezone-customization {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid rgba(78, 168, 222, 0.2);
+  border-radius: 10px;
+  background: rgba(5, 10, 17, 0.5);
+}
+
+.freezone-customization h3 {
+  margin: 0;
+  color: #b9e8ff;
+  font-size: 0.86rem;
+}
+
+.freezone-appearance-picker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.freezone-appearance-picker label,
+.freezone-audio-settings > label,
+.freezone-audio-settings label:not(.freezone-local-toggle) {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.freezone-appearance-picker select,
+.freezone-audio-settings input:not([type="checkbox"]):not([type="range"]),
+.freezone-audio-settings select,
+.freezone-designer-fields textarea {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(4, 6, 11, 0.82);
+  color: var(--text);
+}
+
+.freezone-designer-fields .freezone-field-wide {
+  grid-column: 1 / -1;
+}
+
+.freezone-designer-fields textarea {
+  min-height: 58px;
+  resize: vertical;
+  font: inherit;
+}
+
+.freezone-appearance-preview {
+  display: grid;
+  flex: 0 0 112px;
+  width: 112px;
+  height: 112px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(78, 168, 222, 0.2);
+  border-radius: 10px;
+  background: radial-gradient(circle, rgba(78, 168, 222, 0.12), transparent 74%);
+}
+
+.freezone-appearance-preview canvas {
+  display: block;
+  width: 112px;
+  height: 112px;
+}
+
+.freezone-appearance-preview span {
+  padding: 8px;
+  color: var(--muted);
+  font-size: 0.62rem;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.freezone-audio-settings {
+  display: grid;
+  gap: 9px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.freezone-audio-settings summary {
+  color: #b9e8ff;
+  cursor: pointer;
+  font-size: 0.73rem;
+  font-weight: 700;
+}
+
+.freezone-local-toggle,
+.freezone-music-controls,
+.freezone-audio-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.freezone-local-toggle {
+  color: var(--text);
+  font-size: 0.72rem;
+}
+
+.freezone-voice-lines {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.freezone-music-controls {
+  justify-content: space-between;
+}
+
+.freezone-music-controls button,
+.freezone-audio-url button {
+  flex: 0 0 auto;
+  padding: 8px 10px;
+  border: 1px solid rgba(78, 168, 222, 0.35);
+  border-radius: 7px;
+  background: rgba(78, 168, 222, 0.12);
+  color: #b9e8ff;
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.freezone-music-controls label {
+  display: flex !important;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.freezone-piece-card {
+  position: fixed;
+  z-index: 75;
+  display: grid;
+  width: min(264px, calc(100vw - 16px));
+  max-height: min(320px, calc(100vh - 16px));
+  gap: 5px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid rgba(78, 168, 222, 0.5);
+  border-radius: 9px;
+  background: rgba(7, 12, 19, 0.94);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.42);
+  color: var(--text);
+  font-size: 0.68rem;
+  pointer-events: none;
+}
+
+.freezone-piece-card strong {
+  color: #b9e8ff;
+  font-size: 0.82rem;
+}
+
+.freezone-piece-card span,
+.freezone-piece-card p,
+.freezone-piece-card q {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.freezone-piece-moves {
+  display: grid;
+  width: 100%;
+  max-height: 126px;
+  aspect-ratio: 1;
+  margin-top: 4px;
+  overflow: hidden;
+  border: 1px solid rgba(78, 168, 222, 0.28);
+  border-radius: 5px;
+}
+
+.freezone-piece-moves i {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.freezone-piece-moves i.center {
+  background: rgba(212, 175, 55, 0.34);
+}
+
+.freezone-piece-moves i.ordinary {
+  background: #4ea8de;
+}
+
+.freezone-piece-moves i.jump {
+  background: #32c779;
+}
+
+@media (max-width: 560px) {
+  .freezone-voice-lines {
+    grid-template-columns: 1fr;
+  }
+
+  .freezone-piece-card {
+    max-height: min(260px, calc(100vh - 16px));
+  }
+}
+
 .freezone-join > div {
   display: grid;
   grid-template-columns: 1fr auto;
