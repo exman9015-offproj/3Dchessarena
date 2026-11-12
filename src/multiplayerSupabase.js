@@ -1,4 +1,5 @@
 import { mergeFreezoneRoomState } from './freezoneCustomization.js';
+import { getFreezoneAIRequestSettings } from './freezoneAISettings.js';
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -19,6 +20,65 @@ function requireClient() {
     throw new Error('Preencha VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY no arquivo .env.local.');
   }
   return supabase;
+}
+
+async function invokeFreezoneFunction(name, payload, audio = false) {
+  requireClient();
+  const response = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/functions/v1/${name}`, {
+    method: 'POST',
+    headers: {
+      apikey: supabaseKey,
+      Authorization: `Bearer ${supabaseKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    let message = `Freezone ${name} failed (${response.status}).`;
+    try {
+      const body = await response.text();
+      try {
+        const parsed = JSON.parse(body);
+        if (typeof parsed.error === 'string') message = parsed.error;
+      } catch {
+        if (body) message = body.slice(0, 240);
+      }
+    } catch {
+      message = `Freezone ${name} failed (${response.status}).`;
+    }
+    throw new Error(message);
+  }
+  if (audio) {
+    const blob = await response.blob();
+    if (!blob.size || blob.size > 5 * 1024 * 1024 ||
+        !blob.type.toLowerCase().startsWith('audio/')) {
+      throw new Error('Freezone voice returned empty, non-audio, or oversized content.');
+    }
+    return blob;
+  }
+  try {
+    return await response.json();
+  } catch {
+    throw new Error('Freezone AI returned an unreadable response.');
+  }
+}
+
+export function requestFreezoneAIMove(payload) {
+  const settings = getFreezoneAIRequestSettings();
+  return invokeFreezoneFunction('freezone-ai', {
+    ...payload,
+    provider: settings.textProvider,
+    apiKey: settings.textApiKey
+  });
+}
+
+export function requestFreezoneSpeech(payload) {
+  const settings = getFreezoneAIRequestSettings();
+  return invokeFreezoneFunction('freezone-speech', {
+    ...payload,
+    provider: settings.voiceProvider,
+    apiKey: settings.voiceApiKey
+  }, true);
 }
 
 function throwIfError(error) {

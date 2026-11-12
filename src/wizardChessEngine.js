@@ -6,14 +6,35 @@ import { addFreezoneAppearance } from './freezoneAppearance.js';
 import {
   getFreezoneEliminationLeaders,
   incrementFreezoneEliminations,
+  sanitizeFreezoneAIHistory,
+  sanitizeFreezoneAIDialogue,
   sanitizeFreezoneProfile
 } from './freezoneCustomization.js';
+import {
+  freezoneAICandidateId,
+  normalizeFreezoneAIDecision
+} from './freezoneAi.js';
+import {
+  advanceFreezoneMutantZone,
+  canUpgradeFreezoneEnvelope,
+  computeFreezoneMoves,
+  createFreezoneMutantZone,
+  generateFreezoneOrbPositions,
+  freezoneCapturePhase,
+  freezoneFocusPose,
+  FREEZONE_BOARD_SIZE,
+  FREEZONE_ENVELOPE_OPTIONS,
+  FREEZONE_ORB_TARGET_COUNT,
+  normalizeFreezoneMutantZone,
+  validateFreezoneAudioUrl
+} from './freezoneRules.js';
 import {
   createRoom as createSupabaseRoom,
   findOrCreateQuickMatch,
   fetchRoomState,
   joinRoom as joinSupabaseRoom,
   listPublicRooms as listSupabasePublicRooms,
+  requestFreezoneAIMove,
   resetRoom as resetSupabaseRoom,
   saveFreeModeState as saveSupabaseFreeModeState,
   saveFreezoneState as saveSupabaseFreezoneState,
@@ -377,6 +398,7 @@ export function initWizardChess() {
     }
 
     function enforceCathedralBoundsAndSolidColumns(prevPos, curPos, targetPos) {
+      if (customGameConfig?.gameMode === 'freezone') return;
       clampPointToCathedralRoom(targetPos, true);
       clampPointToCathedralRoom(curPos, false);
 
@@ -1506,6 +1528,17 @@ export function initWizardChess() {
     const freezoneOrbMeshes = new Map();
     const freezonePlayerState = new Map();
     const freezoneEliminationRecords = new Map();
+    const freezoneOrbClaims = new Map();
+    let freezoneMutantMesh = null;
+    let freezoneMutantState = null;
+    let freezoneMutantTickAt = Date.now();
+    let freezoneMutantSyncAt = 0;
+    let freezoneSharedMusicUrl = '';
+    let freezoneMutantZone = null;
+    let freezoneMutantElapsedMs = 0;
+    let freezoneMutantPersistElapsedMs = 0;
+    let freezoneSpeechBubbles = new Map();
+    let freezoneSelectionCamera = null;
     let freezonePersistQueue = Promise.resolve();
     const freezonePendingRoomSaves = new Map();
     let freezoneVoiceEntryRoom = null;
@@ -1513,6 +1546,12 @@ export function initWizardChess() {
     let freezoneLastHoveredPieceId = null;
     let freezoneLastInspectUpdateAt = 0;
     const freezoneVoiceCooldowns = new Map();
+    let freezoneSpeech = null;
+    let freezoneSpeechUpdatedAt = 0;
+    let freezoneSpeechQueue = [];
+    let freezoneDialogueId = '';
+    let freezoneDialogueRoomCode = '';
+    let freezoneAIDialogueBusy = false;
     const freezoneVoiceOutcomes = new Set();
     const FREEZONE_XP_PER_ORB = 1;
     const FREEZONE_XP_COST = 5;
@@ -1528,29 +1567,38 @@ export function initWizardChess() {
     const FREEZONE_MAX_PATTERN_OFFSETS = 48;
     const FREEZONE_BASE_EDITOR_RANGE = 3;
     const FREEZONE_MAX_EDITOR_RANGE = 6;
-    const FREEZONE_EDITOR_RANGE_INCREMENT = 1;
-    const FREEZONE_ORB_TARGET_COUNT = 32;
+    const FREEZONE_BASE_ENVELOPE_ROWS = 2;
+    const FREEZONE_BASE_ENVELOPE_COLS = 2;
+    const FREEZONE_MAX_ENVELOPE_DIMENSION = FREEZONE_MAX_EDITOR_RANGE;
+    const FREEZONE_BASE_STEP_BUDGET = 4;
+    const FREEZONE_STEP_BUDGET_INCREMENT = 2;
+    const FREEZONE_MAX_STEP_BUDGET = 32;
     const FREEZONE_ORB_RULES = {
       xp: { color: 0x45ddff, label: 'XP', description: `+${FREEZONE_XP_PER_ORB} XP` },
       red: {
         color: 0xff5364,
         label: 'Red',
-        description: 'Stored for a move-budget upgrade'
+        description: 'Spend one to gain one more move action per cycle'
+      },
+      blue: {
+        color: 0x4ea8de,
+        label: 'Blue',
+        description: 'Spend one to add 2 unit steps per cycle'
       },
       yellow: {
         color: 0xffd84a,
         label: 'Yellow',
-        description: 'Stored for a cooldown upgrade'
+        description: 'Spend one to reduce rest by 0.3 seconds'
       },
       purple: {
         color: 0xc98bff,
         label: 'Purple',
-        description: 'Stored for an army-capacity upgrade'
+        description: 'Spend one to raise the army limit by one'
       },
       white: {
         color: 0xf3f5ff,
         label: 'White',
-        description: 'Stored for an editor-range upgrade'
+        description: 'Choose a larger movement envelope for one white orb'
       }
     };
     const freezoneOrbMaterials = new Map();
@@ -1906,11 +1954,28 @@ export function initWizardChess() {
       const storedOrbs = value.orbBalances && typeof value.orbBalances === 'object'
         ? value.orbBalances
         : {};
+      const legacyRange = Math.max(FREEZONE_BASE_EDITOR_RANGE, Math.min(
+        FREEZONE_MAX_EDITOR_RANGE,
+        Math.floor(Number(value.editorRange) || FREEZONE_BASE_EDITOR_RANGE)
+      ));
+      const envelopeRows = Math.max(FREEZONE_BASE_ENVELOPE_ROWS, Math.min(
+        FREEZONE_MAX_ENVELOPE_DIMENSION,
+        Math.floor(Number(value.envelopeRows) || legacyRange)
+      ));
+      const envelopeCols = Math.max(FREEZONE_BASE_ENVELOPE_COLS, Math.min(
+        FREEZONE_MAX_ENVELOPE_DIMENSION,
+        Math.floor(Number(value.envelopeCols) || legacyRange)
+      ));
+      const stepBudget = Math.max(FREEZONE_BASE_STEP_BUDGET, Math.min(
+        FREEZONE_MAX_STEP_BUDGET,
+        Math.floor(Number(value.stepBudget) || FREEZONE_BASE_STEP_BUDGET)
+      ));
       return {
         xp,
         orbBalances: {
           xp,
           red: Math.max(0, Math.floor(Number(storedOrbs.red) || 0)),
+          blue: Math.max(0, Math.floor(Number(storedOrbs.blue) || 0)),
           yellow: Math.max(0, Math.floor(Number(storedOrbs.yellow) || 0)),
           purple: Math.max(0, Math.floor(Number(storedOrbs.purple) || 0)),
           white: Math.max(0, Math.floor(Number(storedOrbs.white) || 0))
@@ -1927,12 +1992,16 @@ export function initWizardChess() {
           FREEZONE_BASE_COOLDOWN_MS,
           Math.floor(Number(value.cooldownDurationMs) || FREEZONE_BASE_COOLDOWN_MS)
         )),
-        editorRange: Math.max(FREEZONE_BASE_EDITOR_RANGE, Math.min(
-          FREEZONE_MAX_EDITOR_RANGE,
-          Math.floor(Number(value.editorRange) || FREEZONE_BASE_EDITOR_RANGE)
-        )),
+        envelopeRows,
+        envelopeCols,
+        editorRange: Math.max(envelopeRows, envelopeCols),
+        stepBudget,
+        stepsUsed: Math.max(0, Math.min(stepBudget, Math.floor(Number(value.stepsUsed) || 0))),
         movesUsed: Math.max(0, Math.floor(Number(value.movesUsed) || 0)),
         cooldownUntil: Math.max(0, Number(value.cooldownUntil) || 0),
+        controlledPieceId: typeof value.controlledPieceId === 'string'
+          ? value.controlledPieceId.slice(0, 256)
+          : '',
         movedPieceIds: Array.isArray(value.movedPieceIds)
           ? Array.from(new Set(value.movedPieceIds.filter((id) => typeof id === 'string')))
           : [],
@@ -1943,11 +2012,16 @@ export function initWizardChess() {
     function normalizeFreezonePattern(value) {
       if (!value || !PIECE_TYPES.includes(value.type) || value.type === 'king' ||
           !Array.isArray(value.moves)) return null;
+      const requestedTeleportKeys = new Set((Array.isArray(value.teleports) ? value.teleports : [])
+        .filter((offset) => Array.isArray(offset) && Number.isSafeInteger(offset[0]) &&
+          Number.isSafeInteger(offset[1]))
+        .map(([r, c]) => `${r},${c}`));
       const seen = new Set();
       const moves = [];
       for (const offset of value.moves) {
         if (!Array.isArray(offset) || !Number.isSafeInteger(offset[0]) ||
-            !Number.isSafeInteger(offset[1]) || (offset[0] === 0 && offset[1] === 0) ||
+            !Number.isSafeInteger(offset[1]) ||
+            (offset[0] === 0 && offset[1] === 0 && !requestedTeleportKeys.has('0,0')) ||
             Math.abs(offset[0]) > 8 || Math.abs(offset[1]) > 8) continue;
         const key = `${offset[0]},${offset[1]}`;
         if (seen.has(key)) continue;
@@ -1963,6 +2037,19 @@ export function initWizardChess() {
           .map((offset) => [`${offset[0]},${offset[1]}`, [offset[0], offset[1]]])).values())
         : [];
       const jumpKeys = new Set(jumps.map(([r, c]) => `${r},${c}`));
+      const teleports = Array.isArray(value.teleports)
+        ? Array.from(new Map(value.teleports
+          .filter((offset) => Array.isArray(offset) && moveKeys.has(`${offset[0]},${offset[1]}`))
+          .map((offset) => [`${offset[0]},${offset[1]}`, [offset[0], offset[1]]])).values())
+        : [];
+      const teleportKeys = new Set(teleports.map(([r, c]) => `${r},${c}`));
+      const validMoves = moves.filter(([r, c]) => {
+        const key = `${r},${c}`;
+        if (teleportKeys.has(key)) return true;
+        if (jumpKeys.has(key)) return true;
+        return r !== 0 || c !== 0 ? (r === 0 || c === 0 || Math.abs(r) === Math.abs(c)) : false;
+      });
+      if (!validMoves.length) return null;
       const profile = sanitizeFreezoneProfile(value);
       const name = profile.name;
       const title = profile.title;
@@ -1970,12 +2057,17 @@ export function initWizardChess() {
       const id = JSON.stringify([
         value.type,
         value.slide === true,
-        moves.map(([r, c]) => [r, c, jumpKeys.has(`${r},${c}`)]),
+        validMoves.map(([r, c]) => [
+          r, c, jumpKeys.has(`${r},${c}`), teleportKeys.has(`${r},${c}`)
+        ]),
         name,
         title,
         catchphrase,
         profile.appearance,
         profile.description,
+        profile.personality,
+        profile.language,
+        profile.aiVoice,
         profile.voiceLines
       ]);
       return {
@@ -1985,10 +2077,14 @@ export function initWizardChess() {
         catchphrase,
         appearance: profile.appearance,
         description: profile.description,
+        personality: profile.personality,
+        language: profile.language,
+        aiVoice: profile.aiVoice,
         voiceLines: profile.voiceLines,
         type: value.type,
-        moves,
+        moves: validMoves,
         jumps,
+        teleports,
         slide: value.slide === true
       };
     }
@@ -2015,10 +2111,15 @@ export function initWizardChess() {
           catchphrase: template?.catchphrase || '',
           appearance: template?.appearance || '',
           description: template?.description || '',
+          personality: template?.personality || '',
+          language: template?.language || 'en-US',
+          aiVoice: template?.aiVoice || 'alloy',
           voiceLines: template?.voiceLines || {},
           type,
           moves: template?.moves?.length ? template.moves : defaultCustomMoves(type, side),
-          jumps: template?.jumps || [],
+          jumps: template?.jumps ||
+            (type === 'knight' && !template?.moves?.length ? defaultCustomMoves(type, side) : []),
+          teleports: template?.teleports || [],
           slide: template?.slide ?? ['rook', 'bishop', 'queen'].includes(type)
         });
       }
@@ -2033,10 +2134,14 @@ export function initWizardChess() {
             catchphrase: piece.freeCatchphrase || '',
             appearance: piece.freeAppearance || '',
             description: piece.freeDescription || '',
+            personality: piece.freePersonality || '',
+            language: piece.freeLanguage || 'en-US',
+            aiVoice: piece.freeAIVoice || 'alloy',
             voiceLines: piece.freeVoiceLines || {},
             type: piece.type,
             moves: piece.freeMoves,
             jumps: piece.freeJumps || [],
+            teleports: piece.freeTeleports || [],
             slide: piece.freeSlide
           });
         }
@@ -2058,37 +2163,17 @@ export function initWizardChess() {
       return [[-1, 0]];
     }
 
-    function createFreezoneOrbPositions(boardSize, playerCount, piecesPerPlayer) {
-      const desiredCount = Math.min(
-        FREEZONE_ORB_TARGET_COUNT,
-        Math.max(12, playerCount * Math.max(1, piecesPerPlayer))
-      );
-      const positions = [];
-      const occupied = new Set();
-      const margin = Math.ceil(Math.sqrt(desiredCount));
-      for (let index = 0; index < desiredCount * 8 && positions.length < desiredCount; index++) {
-        const r = Math.floor(Math.random() * boardSize);
-        const c = Math.floor(Math.random() * boardSize);
-        if (r < margin || c < margin || r >= boardSize - margin || c >= boardSize - margin) continue;
-        const key = freeCellKey(r, c);
-        if (occupied.has(key)) continue;
-        occupied.add(key);
-        positions.push({
-          id: `orb-${Math.random().toString(36).slice(2)}-${index}`,
-          r,
-          c,
-          type: randomFreezoneOrbType()
-        });
-      }
-      return positions;
+    function defaultCustomTeleports(type, side) {
+      return [];
     }
 
     function randomFreezoneOrbType() {
       const roll = Math.random();
-      if (roll < 0.64) return 'xp';
-      if (roll < 0.74) return 'red';
-      if (roll < 0.84) return 'yellow';
-      if (roll < 0.92) return 'purple';
+      if (roll < 0.42) return 'xp';
+      if (roll < 0.56) return 'red';
+      if (roll < 0.70) return 'blue';
+      if (roll < 0.82) return 'yellow';
+      if (roll < 0.91) return 'purple';
       return 'white';
     }
 
@@ -2126,7 +2211,10 @@ export function initWizardChess() {
     function normalizeFreeModeState(state) {
       const blocks = [];
       const blockKeys = new Set();
-      const boardSize = Number.isSafeInteger(state?.boardSize) && state.boardSize >= 4
+      const isFreezoneState = state?.config?.gameMode === 'freezone';
+      const boardSize = isFreezoneState
+        ? FREEZONE_BOARD_SIZE
+        : Number.isSafeInteger(state?.boardSize) && state.boardSize >= 4
         ? state.boardSize
         : Number.isSafeInteger(state?.config?.boardSize) && state.config.boardSize >= 4
           ? state.config.boardSize
@@ -2147,9 +2235,12 @@ export function initWizardChess() {
         if (!piece || typeof piece.id !== 'string' || pieceIds.has(piece.id) ||
             !PIECE_TYPES.includes(piece.type) ||
             !['w', 'b', 'r', 'u', 'g', 'o', 'p', 'c', 'm', 'y'].includes(piece.color) ||
-            !Number.isSafeInteger(piece.r) || !Number.isSafeInteger(piece.c)) continue;
+            !Number.isSafeInteger(piece.r) || !Number.isSafeInteger(piece.c) ||
+            piece.r < 0 || piece.c < 0 || piece.r >= boardSize || piece.c >= boardSize) continue;
         pieceIds.add(piece.id);
         const profile = sanitizeFreezoneProfile(piece);
+        const legacyKnightMoves = piece.type === 'knight' &&
+          JSON.stringify(piece.moves) === JSON.stringify(defaultCustomMoves('knight', 0));
         pieces.push({
           id: piece.id,
           type: piece.type,
@@ -2164,13 +2255,22 @@ export function initWizardChess() {
           moves: Array.isArray(piece.moves)
             ? piece.moves.filter((offset) =>
               Array.isArray(offset) && Number.isSafeInteger(offset[0]) &&
-              Number.isSafeInteger(offset[1]) && (offset[0] !== 0 || offset[1] !== 0)
+              Number.isSafeInteger(offset[1]) &&
+              ((offset[0] !== 0 || offset[1] !== 0) ||
+                Array.isArray(piece.teleports) && piece.teleports.some(([r, c]) => r === 0 && c === 0))
             )
             : [],
-          jumps: Array.isArray(piece.jumps)
+          jumps: Array.isArray(piece.jumps) && piece.jumps.length
             ? piece.jumps.filter((offset) =>
               Array.isArray(offset) && Number.isSafeInteger(offset[0]) &&
               Number.isSafeInteger(offset[1]) && (offset[0] !== 0 || offset[1] !== 0) &&
+              piece.moves?.some?.(([r, c]) => r === offset[0] && c === offset[1])
+            )
+            : isFreezoneState && legacyKnightMoves ? piece.moves : [],
+          teleports: Array.isArray(piece.teleports)
+            ? piece.teleports.filter((offset) =>
+              Array.isArray(offset) && Number.isSafeInteger(offset[0]) &&
+              Number.isSafeInteger(offset[1]) &&
               piece.moves?.some?.(([r, c]) => r === offset[0] && c === offset[1])
             )
             : [],
@@ -2207,9 +2307,25 @@ export function initWizardChess() {
           state.config.boardSize >= 4 && Number.isInteger(state.config.playerCount) &&
           state.config.playerCount >= 2 &&
           state.config.playerCount <= (state.config.gameMode === 'freezone' ? 10 : 4)
-        ? state.config
+        ? {
+          ...state.config,
+          ...(state.config.gameMode === 'freezone' ? { boardSize: FREEZONE_BOARD_SIZE } : {})
+        }
         : null;
       const occupied = new Set(pieces.map((piece) => freeCellKey(piece.r, piece.c)));
+      const orbClaims = new Map();
+      for (const claim of isFreezoneState && Array.isArray(state?.orbClaims) ? state.orbClaims : []) {
+        if (!claim || typeof claim.orbId !== 'string' || claim.orbId.length > 256 ||
+            !Number.isInteger(claim.side) || claim.side < 0 || claim.side >= 10 ||
+            !Object.prototype.hasOwnProperty.call(FREEZONE_ORB_RULES, claim.type) ||
+            !Number.isFinite(claim.amount) || claim.amount < 0 || claim.amount > 100) continue;
+        orbClaims.set(claim.orbId, {
+          orbId: claim.orbId,
+          side: claim.side,
+          type: claim.type,
+          amount: claim.amount
+        });
+      }
       const orbIds = new Set();
       const xpOrbs = [];
       for (const orb of Array.isArray(state?.xpOrbs) ? state.xpOrbs : []) {
@@ -2233,6 +2349,15 @@ export function initWizardChess() {
         enabled: state?.enabled === true,
         boardSize,
         config,
+        mutantZone: isFreezoneState
+          ? normalizeFreezoneMutantZone(state?.mutantZone, boardSize)
+          : null,
+        mutantZoneInitialized: isFreezoneState &&
+          (state?.mutantZoneInitialized === true || Boolean(state?.mutantZone)),
+        sharedMusicUrl: isFreezoneState && validateFreezoneAudioUrl(state?.sharedMusicUrl || '').ok
+          ? validateFreezoneAudioUrl(state.sharedMusicUrl).url
+          : '',
+        aiDialogue: isFreezoneState ? sanitizeFreezoneAIDialogue(state?.aiDialogue) : null,
         turnIndex: Number.isInteger(state?.turnIndex) ? state.turnIndex : 0,
         movedPieceIds: Array.isArray(state?.movedPieceIds) ? state.movedPieceIds : [],
         seats: Array.isArray(state?.seats) ? state.seats : [],
@@ -2240,6 +2365,7 @@ export function initWizardChess() {
         freezonePlayers: state?.freezonePlayers || {},
         xpOrbs,
         eliminationRecords: Array.from(eliminationRecords.values()),
+        orbClaims: Array.from(orbClaims.values()).slice(-1024),
         removedBlocks: Array.isArray(state?.removedBlocks)
           ? state.removedBlocks.filter((cell) =>
             Array.isArray(cell) && Number.isSafeInteger(cell[0]) &&
@@ -2315,6 +2441,16 @@ export function initWizardChess() {
       freePieces.clear();
       for (const mesh of freezoneOrbMeshes.values()) scene.remove(mesh);
       freezoneOrbMeshes.clear();
+      if (freezoneMutantMesh) {
+        scene.remove(freezoneMutantMesh);
+        freezoneMutantMesh.traverse((object) => {
+          object.geometry?.dispose?.();
+          if (object.material?.userData?.freezoneMutantMaterial) object.material.dispose();
+        });
+        freezoneMutantMesh = null;
+      }
+      freezoneMutantState = null;
+      freezoneOrbClaims.clear();
       for (const mesh of freeBlocks.values()) {
         freeTileGroup.remove(mesh);
         mesh.geometry.dispose();
@@ -2328,6 +2464,87 @@ export function initWizardChess() {
       selectedFreePieceId = null;
     }
 
+    function renderFreezoneMutantZone(zone) {
+      if (freezoneMutantMesh) {
+        scene.remove(freezoneMutantMesh);
+        freezoneMutantMesh.traverse((object) => {
+          object.geometry?.dispose?.();
+          if (object.material?.userData?.freezoneMutantMaterial) object.material.dispose();
+        });
+        freezoneMutantMesh = null;
+      }
+      freezoneMutantState = zone;
+      if (!zone?.active || customGameConfig?.gameMode !== 'freezone') return;
+
+      const group = new THREE.Group();
+      const radius = zone.radius * BOARD_SQ_SIZE;
+      let geometry;
+      if (zone.shape === 'circle') {
+        geometry = new THREE.CircleGeometry(radius, 48);
+      } else {
+        const shape = new THREE.Shape();
+        const points = zone.shape === 'triangle'
+          ? [[0, -radius], [radius, radius], [-radius, radius]]
+          : [[0, -radius], [radius, 0], [0, radius], [-radius, 0]];
+        shape.moveTo(points[0][0], points[0][1]);
+        for (const [x, y] of points.slice(1)) shape.lineTo(x, y);
+        shape.closePath();
+        geometry = new THREE.ShapeGeometry(shape);
+      }
+      geometry.rotateX(-Math.PI / 2);
+      const fillMaterial = new THREE.MeshBasicMaterial({
+        color: 0x9b59ff,
+        transparent: true,
+        opacity: 0.14,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+      fillMaterial.userData.freezoneMutantMaterial = true;
+      const fill = new THREE.Mesh(geometry, fillMaterial);
+      fill.position.y = FREE_FLOOR_Y + 0.012;
+      const edgeMaterial = new THREE.LineBasicMaterial({
+        color: 0xd6a8ff,
+        transparent: true,
+        opacity: 0.82
+      });
+      edgeMaterial.userData.freezoneMutantMaterial = true;
+      const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geometry), edgeMaterial);
+      edge.position.copy(fill.position);
+      group.add(fill, edge);
+      const center = freeBoardToWorld(zone.r, zone.c);
+      group.position.set(center.x, 0, center.z);
+      group.userData.mutantZone = true;
+      scene.add(group);
+      freezoneMutantMesh = group;
+    }
+
+    function updateFreezoneMutantTimer() {
+      if (customGameConfig?.gameMode !== 'freezone') return;
+      const now = Date.now();
+      const elapsed = Math.max(0, now - freezoneMutantTickAt);
+      freezoneMutantTickAt = now;
+      const isAuthority = gameMode !== 'multi' || customPlayerIndex === 0;
+      if (!isAuthority) return;
+
+      if (!freeModeState?.mutantZoneInitialized) {
+        freeModeState.mutantZoneInitialized = true;
+        freezoneMutantState = createFreezoneMutantZone(customGameConfig.boardSize);
+        renderFreezoneMutantZone(freezoneMutantState);
+        freezoneMutantSyncAt = now;
+        persistFreeModeState();
+      } else if (freezoneMutantState?.active) {
+        freezoneMutantState = advanceFreezoneMutantZone(freezoneMutantState, elapsed);
+        if (!freezoneMutantState.active) freezoneMutantState = null;
+        renderFreezoneMutantZone(freezoneMutantState);
+      }
+
+      publishFreezoneHud();
+      if (now - freezoneMutantSyncAt >= 5000) {
+        freezoneMutantSyncAt = now;
+        persistFreeModeState();
+      }
+    }
+
     function freeStateSignature(state) {
       return JSON.stringify(normalizeFreeModeState(state));
     }
@@ -2339,8 +2556,12 @@ export function initWizardChess() {
         button.setAttribute('aria-pressed', String(freeModeActive));
       });
       document.querySelectorAll('.free-block-toggle').forEach((button) => {
-        button.style.display = freeModeActive ? 'inline-flex' : 'none';
-        button.textContent = freeBlockRemoval ? 'Place Blocks' : 'Remove Blocks';
+        const label = freeBlockRemoval ? 'Place Blocks' : 'Remove Blocks';
+        button.style.display = freeModeActive && customGameConfig?.gameMode !== 'freezone'
+          ? 'inline-flex'
+          : 'none';
+        button.setAttribute('aria-label', label);
+        button.title = label;
         button.classList.toggle('active', freeBlockRemoval);
         button.setAttribute('aria-pressed', String(freeBlockRemoval));
       });
@@ -2356,6 +2577,14 @@ export function initWizardChess() {
         seats: customSeats,
         eliminatedSeats: customEliminatedSeats,
         freezonePlayers: Object.fromEntries(freezonePlayerState),
+        mutantZone: customGameConfig?.gameMode === 'freezone' ? freezoneMutantState : null,
+        mutantZoneInitialized: customGameConfig?.gameMode === 'freezone'
+          ? freeModeState?.mutantZoneInitialized === true
+          : false,
+        sharedMusicUrl: customGameConfig?.gameMode === 'freezone' ? freezoneSharedMusicUrl : '',
+        aiDialogue: customGameConfig?.gameMode === 'freezone'
+          ? freeModeState?.aiDialogue || null
+          : null,
         xpOrbs: Array.from(freezoneOrbMeshes.keys(), (id) => {
           const mesh = freezoneOrbMeshes.get(id);
           return mesh
@@ -2364,6 +2593,9 @@ export function initWizardChess() {
         }).filter(Boolean),
         eliminationRecords: customGameConfig?.gameMode === 'freezone'
           ? Array.from(freezoneEliminationRecords.values())
+          : [],
+        orbClaims: customGameConfig?.gameMode === 'freezone'
+          ? Array.from(freezoneOrbClaims.values())
           : [],
         removedBlocks: Array.from(customRemovedBlocks, (key) => key.split(',').map(Number)),
         blocks: Array.from(freeBlocks.keys(), (key) => key.split(',').map(Number)),
@@ -2376,6 +2608,9 @@ export function initWizardChess() {
             catchphrase: piece.freeCatchphrase || '',
             appearance: piece.freeAppearance || '',
             description: piece.freeDescription || '',
+            personality: piece.freePersonality || '',
+            language: piece.freeLanguage || 'en-US',
+            aiVoice: piece.freeAIVoice || 'alloy',
             voiceLines: piece.freeVoiceLines || {}
           }),
           eliminations: Math.max(0, Math.min(999999, piece.freeEliminations || 0)),
@@ -2385,6 +2620,7 @@ export function initWizardChess() {
           c: piece.c,
           moves: piece.freeMoves || [],
           jumps: piece.freeJumps || [],
+          teleports: piece.freeTeleports || [],
           slide: piece.freeSlide === true
         }))
       };
@@ -2419,22 +2655,36 @@ export function initWizardChess() {
           movesPerCycle: player.movesPerCycle,
           cooldownDurationMs: player.cooldownDurationMs,
           editorRange: player.editorRange,
+          envelopeRows: player.envelopeRows,
+          envelopeCols: player.envelopeCols,
+          stepBudget: player.stepBudget,
+          stepsUsed: player.stepsUsed,
           maxPatternOffsets: FREEZONE_MAX_PATTERN_OFFSETS,
           upgradeLevels: {
             red: player.movesPerCycle - FREEZONE_BASE_MOVES_PER_CYCLE,
+            blue: (player.stepBudget - FREEZONE_BASE_STEP_BUDGET) / FREEZONE_STEP_BUDGET_INCREMENT,
             yellow: Math.ceil(
               (FREEZONE_BASE_COOLDOWN_MS - player.cooldownDurationMs) /
               FREEZONE_COOLDOWN_REDUCTION_MS
             ),
             purple: player.capacity - FREEZONE_BASE_CAPACITY,
-            white: player.editorRange - FREEZONE_BASE_EDITOR_RANGE
+            white: Math.max(
+              0,
+              player.envelopeRows + player.envelopeCols -
+              FREEZONE_BASE_ENVELOPE_ROWS - FREEZONE_BASE_ENVELOPE_COLS
+            )
           },
           orbBalances: { ...player.orbBalances },
           canUpgrade: {
             red: player.movesPerCycle < FREEZONE_MAX_MOVES_PER_CYCLE,
+            blue: player.stepBudget < FREEZONE_MAX_STEP_BUDGET,
             yellow: player.cooldownDurationMs > FREEZONE_MIN_COOLDOWN_MS,
             purple: player.capacity < FREEZONE_MAX_CAPACITY,
-            white: player.editorRange < FREEZONE_MAX_EDITOR_RANGE
+            white: FREEZONE_ENVELOPE_OPTIONS.some((option) =>
+              canUpgradeFreezoneEnvelope(
+                player.envelopeRows, player.envelopeCols, option.rows, option.cols
+              )
+            )
           },
           movesUsed,
           cooldownMs: Math.max(0, player.cooldownUntil - now),
@@ -2445,10 +2695,14 @@ export function initWizardChess() {
             title: piece.freeTitle || '',
             catchphrase: piece.freeCatchphrase || '',
             description: piece.freeDescription || '',
+            personality: piece.freePersonality || '',
+            language: piece.freeLanguage || 'en-US',
+            aiVoice: piece.freeAIVoice || 'alloy',
             appearance: piece.freeAppearance || '',
             eliminations: Math.max(0, piece.freeEliminations || 0),
             moves: piece.freeMoves || [],
             jumps: piece.freeJumps || [],
+            teleports: piece.freeTeleports || [],
             slide: piece.freeSlide === true,
             voiceLines: piece.freeVoiceLines || {},
             type: piece.type
@@ -2459,10 +2713,14 @@ export function initWizardChess() {
             title: piece.freeTitle || '',
             catchphrase: piece.freeCatchphrase || '',
             description: piece.freeDescription || '',
+            personality: piece.freePersonality || '',
+            language: piece.freeLanguage || 'en-US',
+            aiVoice: piece.freeAIVoice || 'alloy',
             appearance: piece.freeAppearance || '',
             eliminations: Math.max(0, piece.freeEliminations || 0),
             moves: piece.freeMoves || [],
             jumps: piece.freeJumps || [],
+            teleports: piece.freeTeleports || [],
             slide: piece.freeSlide === true,
             side: piece.freeSide,
             voiceLines: piece.freeVoiceLines || {},
@@ -2478,6 +2736,9 @@ export function initWizardChess() {
             color: `#${rule.color.toString(16).padStart(6, '0')}`
           })),
           boardSize: customGameConfig.boardSize,
+          mutantZone: freezoneMutantState,
+          mutantZoneRemainingMs: freezoneMutantState?.remainingMs || 0,
+          sharedMusicUrl: freezoneSharedMusicUrl,
           roomCode,
           pieceOptions: freezonePieceOptions(side)
         }
@@ -2526,13 +2787,68 @@ export function initWizardChess() {
         const group = new THREE.Group();
         const core = new THREE.Mesh(freezoneOrbCoreGeometry, materials.core);
         const glow = new THREE.Mesh(freezoneOrbGlowGeometry, materials.glow);
+        core.userData.freezoneOrbCore = true;
+        glow.userData.freezoneOrbGlow = true;
         group.add(glow, core);
         const pos = freeBoardToWorld(orb.r, orb.c);
         group.position.set(pos.x, FREE_FLOOR_Y + 0.12, pos.z);
-        group.userData = { r: orb.r, c: orb.c, type };
+        group.userData = { r: orb.r, c: orb.c, type, baseY: FREE_FLOOR_Y + 0.12, phase: Math.random() * Math.PI * 2 };
         scene.add(group);
         freezoneOrbMeshes.set(orb.id, group);
       }
+    }
+
+    function queueFreezoneAIDialogue(dialogue) {
+      const safeDialogue = sanitizeFreezoneAIDialogue(dialogue);
+      if (!safeDialogue || safeDialogue.id === freezoneDialogueId) return;
+      freezoneDialogueId = safeDialogue.id;
+      freezoneSpeechQueue = safeDialogue.lines.map((line) => ({
+        ...line,
+        voiceId: freePieces.get(line.pieceId)?.freeAIVoice || 'alloy',
+        dialogueId: safeDialogue.id,
+        roomCode
+      }));
+      updateFreezoneSpeech();
+    }
+
+    function updateFreezoneSpeech() {
+      const now = Date.now();
+      if (freezoneSpeech &&
+          (now >= freezoneSpeech.until || !freePieces.get(freezoneSpeech.pieceId)?.mesh)) {
+        freezoneSpeech = null;
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-speech', {
+          detail: null
+        }));
+      }
+      if (!freezoneSpeech) {
+        while (freezoneSpeechQueue.length) {
+          const next = freezoneSpeechQueue.shift();
+          if (!freePieces.has(next.pieceId)) continue;
+          freezoneSpeech = {
+            pieceId: next.pieceId,
+            text: next.text,
+            until: now + 4500
+          };
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-voice', {
+            detail: next
+          }));
+          break;
+        }
+      }
+      if (!freezoneSpeech || now < freezoneSpeechUpdatedAt) return;
+      const piece = freePieces.get(freezoneSpeech.pieceId);
+      if (!piece?.mesh) return;
+      const point = piece.mesh.getWorldPosition(new THREE.Vector3());
+      point.y += 0.62;
+      point.project(camera);
+      const x = (point.x + 1) * 0.5 * window.innerWidth;
+      const y = (1 - point.y) * 0.5 * window.innerHeight;
+      const visible = point.z >= -1 && point.z <= 1 &&
+        x >= 0 && x <= window.innerWidth && y >= 0 && y <= window.innerHeight;
+      window.dispatchEvent(new CustomEvent('wizard-chess-freezone-speech', {
+        detail: visible ? { text: freezoneSpeech.text, x, y } : null
+      }));
+      freezoneSpeechUpdatedAt = now + 80;
     }
 
     function ensureFreezoneOrbPopulation() {
@@ -2550,6 +2866,7 @@ export function initWizardChess() {
           if (!occupied.has(freeCellKey(r, c))) freeCells.push({ r, c });
         }
       }
+      updateFreezoneSpeech();
       while (freezoneOrbMeshes.size < FREEZONE_ORB_TARGET_COUNT && freeCells.length) {
         const index = Math.floor(Math.random() * freeCells.length);
         const [{ r, c }] = freeCells.splice(index, 1);
@@ -2617,7 +2934,7 @@ export function initWizardChess() {
       }
       const freezone = config.gameMode === 'freezone';
       const generatedArmy = freezone || config.allowPieceSelection === true;
-      const boardSize = freezone ? 32 : config.boardSize;
+      const boardSize = freezone ? FREEZONE_BOARD_SIZE : config.boardSize;
       const templates = config.pieces;
       const normalizedConfig = {
         ...config,
@@ -2653,7 +2970,9 @@ export function initWizardChess() {
                 return {
                   type,
                   moves: template?.moves?.length ? template.moves : defaultCustomMoves(type, side),
-                  jumps: template?.jumps || [],
+                  jumps: template?.jumps ||
+                    (type === 'knight' && !template?.moves?.length ? defaultCustomMoves(type, side) : []),
+                  teleports: template?.teleports || [],
                   slide: template?.slide ?? ['rook', 'bishop', 'queen'].includes(type)
                 };
               });
@@ -2673,7 +2992,11 @@ export function initWizardChess() {
                 r,
                 c,
                 moves: template.moves?.length ? template.moves : defaultCustomMoves(template.type, side),
-                jumps: template.jumps || [],
+                jumps: template.jumps ||
+                  (template.type === 'knight' && !template.moves?.length
+                    ? defaultCustomMoves(template.type, side)
+                    : []),
+                teleports: template.teleports || [],
                 slide: template.slide ?? ['rook', 'bishop', 'queen'].includes(template.type)
               };
             });
@@ -2703,6 +3026,9 @@ export function initWizardChess() {
               r: Math.max(0, Math.min(boardSize - 1, baseR + rowOffset - Math.floor(width / 2))),
               c: Math.max(0, Math.min(boardSize - 1, baseC + colOffset - Math.floor(width / 2))),
               moves: template?.moves?.length ? template.moves : defaultCustomMoves(type, side),
+              jumps: template?.jumps || [],
+              teleports: template?.teleports ||
+                (!template?.moves?.length ? defaultCustomTeleports(type, side) : []),
               slide: template?.slide ?? ['rook', 'bishop', 'queen'].includes(type)
             };
           });
@@ -2754,16 +3080,27 @@ export function initWizardChess() {
               xp: 0,
               capacity: FREEZONE_BASE_CAPACITY,
               movesPerCycle: FREEZONE_BASE_MOVES_PER_CYCLE,
+              stepBudget: FREEZONE_BASE_STEP_BUDGET,
+              stepsUsed: 0,
               cooldownDurationMs: FREEZONE_BASE_COOLDOWN_MS,
               editorRange: FREEZONE_BASE_EDITOR_RANGE,
+              envelopeRows: FREEZONE_BASE_ENVELOPE_ROWS,
+              envelopeCols: FREEZONE_BASE_ENVELOPE_COLS,
               movesUsed: 0,
               cooldownUntil: 0
             }
           ])
         ),
+        mutantZone: freezone ? createFreezoneMutantZone(boardSize) : null,
+        mutantZoneInitialized: freezone,
+        sharedMusicUrl: '',
         xpOrbs: freezone
-          ? createFreezoneOrbPositions(boardSize, config.playerCount, config.piecesPerPlayer)
-          : []
+          ? generateFreezoneOrbPositions(
+            boardSize,
+            pieces.map((piece) => freeCellKey(piece.r, piece.c)),
+            FREEZONE_ORB_TARGET_COUNT
+          )
+          : [],
       };
     }
 
@@ -2812,11 +3149,15 @@ export function initWizardChess() {
         piece.freeTitle = template.title || '';
         piece.freeCatchphrase = template.catchphrase || '';
         piece.freeDescription = template.description || '';
+        piece.freePersonality = template.personality || '';
+        piece.freeLanguage = template.language || 'en-US';
+        piece.freeAIVoice = template.aiVoice || 'alloy';
         piece.freeAppearance = appearance || '';
         piece.freeVoiceLines = sanitizeFreezoneProfile(template).voiceLines;
         piece.freeEliminations = 0;
         piece.freeMoves = template.moves?.length ? template.moves : defaultCustomMoves(type, side);
         piece.freeJumps = template.jumps || [];
+        piece.freeTeleports = template.teleports || [];
         piece.freeSlide = template.slide ?? ['rook', 'bishop', 'queen'].includes(type);
         piece.mesh.traverse((child) => { child.userData.freePiece = piece; });
         freePieces.set(piece.freeId, piece);
@@ -2831,15 +3172,18 @@ export function initWizardChess() {
         if (mesh.userData.r !== r || mesh.userData.c !== c) continue;
         scene.remove(mesh);
         freezoneOrbMeshes.delete(id);
-        collected.push(mesh.userData.type || 'xp');
+        collected.push({ id, type: mesh.userData.type || 'xp' });
       }
       if (!collected.length) return;
       const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
       const notices = [];
-      for (const type of collected) {
+      for (const { id, type } of collected) {
+        if (freezoneOrbClaims.has(id)) continue;
+        const amount = type === 'xp' ? FREEZONE_XP_PER_ORB : 1;
+        freezoneOrbClaims.set(id, { orbId: id, side, type, amount });
         player.orbBalances[type] = (player.orbBalances[type] || 0) + 1;
         if (type === 'xp') {
-          player.xp += FREEZONE_XP_PER_ORB;
+          player.xp += amount;
         }
         notices.push(type === 'xp'
           ? `XP collected and saved (${player.xp} XP).`
@@ -2867,6 +3211,7 @@ export function initWizardChess() {
       }
       if (player.cooldownUntil > 0) {
         player.movesUsed = 0;
+        player.stepsUsed = 0;
         player.cooldownUntil = 0;
         player.movedPieceIds = [];
         freezonePlayerState.set(side, player);
@@ -2875,11 +3220,12 @@ export function initWizardChess() {
       return true;
     }
 
-    function recordFreezoneMove(side) {
+    function recordFreezoneMove(side, stepCost = 1, pieceId = '') {
       const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
       player.movesUsed += 1;
-      player.movedPieceIds = [];
-      if (player.movesUsed >= player.movesPerCycle) {
+      player.stepsUsed += Math.max(1, Math.floor(stepCost));
+      if (pieceId && !player.movedPieceIds.includes(pieceId)) player.movedPieceIds.push(pieceId);
+      if (player.movesUsed >= player.movesPerCycle || player.stepsUsed >= player.stepBudget) {
         player.cooldownUntil = Date.now() + player.cooldownDurationMs;
       }
       freezonePlayerState.set(side, player);
@@ -2892,11 +3238,19 @@ export function initWizardChess() {
       }
       const side = gameMode === 'multi' ? customPlayerIndex : 0;
       if (side < 0) return { ok: false, error: 'Spectators cannot buy upgrades.' };
+      if (type === 'white') {
+        return { ok: false, error: 'Choose an envelope size before spending a white orb.' };
+      }
       const limits = {
         red: player => player.movesPerCycle < FREEZONE_MAX_MOVES_PER_CYCLE,
+        blue: player => player.stepBudget < FREEZONE_MAX_STEP_BUDGET,
         yellow: player => player.cooldownDurationMs > FREEZONE_MIN_COOLDOWN_MS,
         purple: player => player.capacity < FREEZONE_MAX_CAPACITY,
-        white: player => player.editorRange < FREEZONE_MAX_EDITOR_RANGE
+        white: player => FREEZONE_ENVELOPE_OPTIONS.some((option) =>
+          canUpgradeFreezoneEnvelope(
+            player.envelopeRows, player.envelopeCols, option.rows, option.cols
+          )
+        )
       };
       if (!Object.prototype.hasOwnProperty.call(limits, type)) {
         return { ok: false, error: 'Choose a valid orb upgrade.' };
@@ -2915,6 +3269,11 @@ export function initWizardChess() {
           FREEZONE_MAX_MOVES_PER_CYCLE,
           player.movesPerCycle + FREEZONE_MOVE_LIMIT_INCREMENT
         );
+      } else if (type === 'blue') {
+        player.stepBudget = Math.min(
+          FREEZONE_MAX_STEP_BUDGET,
+          player.stepBudget + FREEZONE_STEP_BUDGET_INCREMENT
+        );
       } else if (type === 'yellow') {
         player.cooldownDurationMs = Math.max(
           FREEZONE_MIN_COOLDOWN_MS,
@@ -2925,17 +3284,56 @@ export function initWizardChess() {
           FREEZONE_MAX_CAPACITY,
           player.capacity + FREEZONE_CAPACITY_INCREMENT
         );
-      } else {
-        player.editorRange = Math.min(
-          FREEZONE_MAX_EDITOR_RANGE,
-          player.editorRange + FREEZONE_EDITOR_RANGE_INCREMENT
-        );
       }
       freezonePlayerState.set(side, player);
       publishFreezoneHud();
       const result = await persistFreeModeState();
       if (!result.ok) {
         return { ok: false, error: `Upgrade applied locally, but arena sync was not confirmed: ${result.error}` };
+      }
+      return { ok: true };
+    }
+
+    async function upgradeFreezoneEnvelope(rows, cols) {
+      if (!customGameConfig || customGameConfig.gameMode !== 'freezone') {
+        return { ok: false, error: 'Start or join a Freezone arena first.' };
+      }
+      const side = gameMode === 'multi' ? customPlayerIndex : 0;
+      if (side < 0) return { ok: false, error: 'Spectators cannot buy upgrades.' };
+      const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
+      if (!canUpgradeFreezoneEnvelope(
+        player.envelopeRows, player.envelopeCols, rows, cols
+      )) return { ok: false, error: 'Choose a larger valid envelope.' };
+      if (player.orbBalances.white < 1) {
+        return { ok: false, error: 'Collect a white envelope orb before upgrading.' };
+      }
+      player.orbBalances.white -= 1;
+      player.envelopeRows = rows;
+      player.envelopeCols = cols;
+      player.editorRange = Math.max(rows, cols);
+      freezonePlayerState.set(side, player);
+      publishFreezoneHud();
+      const result = await persistFreeModeState();
+      if (!result.ok) {
+        return { ok: false, error: `Envelope changed locally, but arena sync was not confirmed: ${result.error}` };
+      }
+      return { ok: true };
+    }
+
+    async function setFreezoneSharedMusicUrl(value) {
+      if (!customGameConfig || customGameConfig.gameMode !== 'freezone') {
+        return { ok: false, error: 'Start or join a Freezone arena first.' };
+      }
+      const validation = value ? validateFreezoneAudioUrl(value) : { ok: true, url: '' };
+      if (!validation.ok) return { ok: false, error: validation.error };
+      freezoneSharedMusicUrl = validation.url;
+      window.dispatchEvent(new CustomEvent('wizard-chess-freezone-music', {
+        detail: freezoneSharedMusicUrl
+      }));
+      publishFreezoneHud();
+      const result = await persistFreeModeState();
+      if (!result.ok) {
+        return { ok: false, error: `Music URL updated locally, but room sync was not confirmed: ${result.error}` };
       }
       return { ok: true };
     }
@@ -2962,11 +3360,11 @@ export function initWizardChess() {
         return { ok: false, error: `Collect ${FREEZONE_XP_COST - player.xp} more XP to acquire a piece.` };
       }
       if (normalized.moves.some(([r, c]) =>
-        Math.max(Math.abs(r), Math.abs(c)) > player.editorRange
+        Math.abs(r) > player.envelopeRows || Math.abs(c) > player.envelopeCols
       )) {
         return {
           ok: false,
-          error: `This pattern exceeds your ${player.editorRange}-tile editor range. Collect a white orb to extend it.`
+          error: `This pattern exceeds your ${player.envelopeRows}×${player.envelopeCols} envelope. Spend a white orb to enlarge it.`
         };
       }
 
@@ -3039,11 +3437,15 @@ export function initWizardChess() {
       piece.freeTitle = normalized.title;
       piece.freeCatchphrase = normalized.catchphrase;
       piece.freeDescription = normalized.description;
+      piece.freePersonality = normalized.personality;
+      piece.freeLanguage = normalized.language;
+      piece.freeAIVoice = normalized.aiVoice;
       piece.freeAppearance = normalized.appearance;
       piece.freeVoiceLines = normalized.voiceLines;
       piece.freeEliminations = 0;
       piece.freeMoves = normalized.moves;
       piece.freeJumps = normalized.jumps;
+      piece.freeTeleports = normalized.teleports;
       piece.freeSlide = normalized.slide;
       piece.mesh.traverse((child) => { child.userData.freePiece = piece; });
       const position = freeBoardToWorld(spawn.r, spawn.c);
@@ -3128,7 +3530,24 @@ export function initWizardChess() {
     function renderFreeModeState(state) {
       clearFreeWorld();
       const normalized = normalizeFreeModeState(state);
+      let dialogueToQueue = null;
+      if (freezoneDialogueRoomCode !== roomCode) {
+        freezoneDialogueRoomCode = roomCode;
+        freezoneDialogueId = normalized.aiDialogue?.id || '';
+        freezoneSpeechQueue = [];
+        freezoneSpeech = null;
+        freezoneSpeechUpdatedAt = 0;
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-speech', {
+          detail: null
+        }));
+      } else if (normalized.aiDialogue?.id &&
+          freezoneDialogueId && normalized.aiDialogue.id !== freezoneDialogueId) {
+        dialogueToQueue = normalized.aiDialogue;
+      } else {
+        freezoneDialogueId = normalized.aiDialogue?.id || '';
+      }
       customGameConfig = normalized.config;
+      orbitControls.maxDistance = customGameConfig?.gameMode === 'freezone' ? 60 : 36;
       customTurnIndex = normalized.turnIndex;
       customMovedPieceIds = normalized.movedPieceIds;
       customSeats = normalized.seats;
@@ -3140,6 +3559,23 @@ export function initWizardChess() {
       freezoneEliminationRecords.clear();
       for (const record of normalized.eliminationRecords) {
         freezoneEliminationRecords.set(record.id, record);
+      }
+      freezoneOrbClaims.clear();
+      for (const claim of normalized.orbClaims) {
+        freezoneOrbClaims.set(claim.orbId, claim);
+      }
+      if (customGameConfig?.gameMode === 'freezone') {
+        freezoneMutantState = normalized.mutantZone;
+        freezoneSharedMusicUrl = normalized.sharedMusicUrl;
+        freezoneMutantTickAt = Date.now();
+        freezoneMutantSyncAt = Date.now();
+        renderFreezoneMutantZone(normalized.mutantZone);
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-music', {
+          detail: normalized.sharedMusicUrl
+        }));
+      } else {
+        freezoneSharedMusicUrl = '';
+        renderFreezoneMutantZone(null);
       }
       if (customGameConfig) {
         createCustomBoard(customGameConfig.boardSize);
@@ -3155,6 +3591,9 @@ export function initWizardChess() {
         piece.freeTitle = data.title || '';
         piece.freeCatchphrase = data.catchphrase || '';
         piece.freeDescription = data.description || '';
+        piece.freePersonality = data.personality || '';
+        piece.freeLanguage = data.language || 'en-US';
+        piece.freeAIVoice = data.aiVoice || 'alloy';
         piece.freeAppearance = data.appearance || '';
         piece.freeVoiceLines = data.voiceLines || {};
         piece.freeEliminations = Math.max(
@@ -3163,6 +3602,7 @@ export function initWizardChess() {
         );
         piece.freeMoves = data.moves;
         piece.freeJumps = data.jumps || [];
+        piece.freeTeleports = data.teleports || [];
         piece.freeSlide = data.slide;
         const pos = freeBoardToWorld(data.r, data.c);
         piece.mesh.position.set(pos.x, freeSurfaceY(data.r, data.c), pos.z);
@@ -3172,8 +3612,22 @@ export function initWizardChess() {
       }
       if (customGameConfig?.gameMode === 'freezone') {
         spawnFreezoneOrbs(normalized.xpOrbs);
+        const side = gameMode === 'multi' ? customPlayerIndex : 0;
+        const player = freezonePlayerState.get(side);
+        const selected = player?.controlledPieceId
+          ? freePieces.get(player.controlledPieceId)
+          : null;
+        if (selected?.freeSide === side) {
+          selectedFreePieceId = selected.freeId;
+          showSquareHighlights(
+            selected.r,
+            selected.c,
+            customMovesForPiece(selected)
+          );
+        }
       }
       freeModeState = normalized;
+      if (dialogueToQueue) queueFreezoneAIDialogue(dialogueToQueue);
       publishFreezoneHud();
       emitFreezoneEntryIfReady();
     }
@@ -3210,6 +3664,7 @@ export function initWizardChess() {
       const snapshot = freeModeReturnSnapshot;
       freeModeReturnSnapshot = null;
       customGameConfig = null;
+      orbitControls.maxDistance = 36;
       if (cathedralRoot) cathedralRoot.visible = true;
       customSeats = [];
       customTurnIndex = 0;
@@ -3217,6 +3672,11 @@ export function initWizardChess() {
       customEliminatedSeats = [];
       customPlayerIndex = -1;
       freeModeState = { enabled: false, blocks: [], pieces: [] };
+      freezoneSpeech = null;
+      freezoneSpeechQueue = [];
+      freezoneDialogueId = '';
+      freezoneDialogueRoomCode = '';
+      window.dispatchEvent(new CustomEvent('wizard-chess-freezone-speech', { detail: null }));
       if (snapshot) restoreBoardSnapshot(snapshot);
       updateFreeModeUI();
       updateTurnUI();
@@ -3269,7 +3729,7 @@ export function initWizardChess() {
       if (orientCamera) {
         const viewSide = playerColor === 'b' ? 'b' : 'w';
         playerCamSide = viewSide;
-        setActiveCamButton('btn-cam-player');
+        setActiveCameraPreset('player');
         setCameraForSide(viewSide, false);
       }
 
@@ -3277,6 +3737,21 @@ export function initWizardChess() {
       updateTurnUI();
       if (typeof updateScriptBarUI === 'function') updateScriptBarUI();
       maybeScheduleAIMove();
+    }
+
+    function leaveCurrentGame() {
+      stopMultiplayerSync();
+      if (freeModeActive) setFreeMode(false, null, true);
+      gameMode = 'single';
+      playerColor = 'w';
+      roomCode = null;
+      customPlayerIndex = -1;
+      appliedMoveSeq = 0;
+      lastFreezoneSeatTokens = null;
+      scriptedGameActive = false;
+      freezoneVoiceEntryRoom = null;
+      window.history.replaceState({}, '', window.location.pathname);
+      resetChessBoard(true);
     }
 
     // =========================================================================
@@ -3465,7 +3940,11 @@ export function initWizardChess() {
     // =========================================================================
     function clearSquareHighlights() {
       while (squareHighlightsGroup.children.length > 0) {
-        squareHighlightsGroup.remove(squareHighlightsGroup.children[0]);
+        const child = squareHighlightsGroup.children[0];
+        squareHighlightsGroup.remove(child);
+        child.geometry?.dispose?.();
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        for (const material of materials) material?.dispose?.();
       }
     }
 
@@ -3482,10 +3961,25 @@ export function initWizardChess() {
       for (const m of moves) {
         const pos = freeModeActive ? freeBoardToWorld(m.r, m.c) : boardToWorld(m.r, m.c);
         const surfaceY = freeModeActive ? freeSurfaceY(m.r, m.c) : BOARD_SURFACE_Y;
+        const pathColor = m.kind === 'jump' ? 0x32c779
+          : m.kind === 'teleport' ? 0xff4b55
+            : 0x4ea8de;
+        if (freeModeActive && Array.isArray(m.path) && m.path.length > 1) {
+          const points = [freeBoardToWorld(r, c), ...m.path.map((cell) => freeBoardToWorld(cell.r, cell.c))]
+            .map((point) => new THREE.Vector3(point.x, FREE_FLOOR_Y + 0.025, point.z));
+          const pathGeometry = new THREE.BufferGeometry().setFromPoints(points);
+          const pathMaterial = new THREE.LineBasicMaterial({
+            color: pathColor,
+            transparent: true,
+            opacity: 0.9,
+            depthTest: false
+          });
+          squareHighlightsGroup.add(new THREE.Line(pathGeometry, pathMaterial));
+        }
         if (m.capture) {
           const capGeo = new THREE.RingGeometry(0.12, 0.16, 32);
           capGeo.rotateX(-Math.PI / 2);
-          const capMat = new THREE.MeshBasicMaterial({ color: 0xe63946, side: THREE.DoubleSide });
+          const capMat = new THREE.MeshBasicMaterial({ color: pathColor, side: THREE.DoubleSide });
           const capMesh = new THREE.Mesh(capGeo, capMat);
           capMesh.position.set(pos.x, surfaceY + 0.012, pos.z);
           squareHighlightsGroup.add(capMesh);
@@ -3493,7 +3987,7 @@ export function initWizardChess() {
           const dotGeo = new THREE.CircleGeometry(0.06, 24);
           dotGeo.rotateX(-Math.PI / 2);
           const dotMat = new THREE.MeshBasicMaterial({
-            color: 0x4ea8de,
+            color: pathColor,
             transparent: true,
             opacity: 0.85,
             side: THREE.DoubleSide
@@ -3501,6 +3995,18 @@ export function initWizardChess() {
           const dotMesh = new THREE.Mesh(dotGeo, dotMat);
           dotMesh.position.set(pos.x, surfaceY + 0.01, pos.z);
           squareHighlightsGroup.add(dotMesh);
+        }
+        if (m.kind === 'teleport' && freeModeActive) {
+          const pulseGeometry = new THREE.RingGeometry(0.17, 0.2, 28);
+          pulseGeometry.rotateX(-Math.PI / 2);
+          const pulse = new THREE.Mesh(pulseGeometry, new THREE.MeshBasicMaterial({
+            color: pathColor,
+            transparent: true,
+            opacity: 0.8,
+            side: THREE.DoubleSide
+          }));
+          pulse.position.set(pos.x, surfaceY + 0.014, pos.z);
+          squareHighlightsGroup.add(pulse);
         }
       }
     }
@@ -4736,7 +5242,9 @@ export function initWizardChess() {
       document.body.classList.toggle('cinematic-ui-hidden', shouldHide);
       const btnHide = document.getElementById('btn-hide-ui');
       if (btnHide) {
-        btnHide.textContent = shouldHide ? 'Show UI [H]' : 'Hide UI [H]';
+        const label = shouldHide ? 'Show HUD controls' : 'Hide HUD controls';
+        btnHide.setAttribute('aria-label', label);
+        btnHide.title = `${label} (Shortcut: H)`;
       }
       return shouldHide;
     }
@@ -5267,8 +5775,21 @@ export function initWizardChess() {
       const cooldown = eventKey === 'vulnerable' ? 30000 : 15000;
       if (now - (freezoneVoiceCooldowns.get(cooldownKey) || 0) < cooldown) return;
       freezoneVoiceCooldowns.set(cooldownKey, now);
+      freezoneSpeech = {
+        pieceId: piece.freeId,
+        text: line.trim().slice(0, 120),
+        until: now + 4500
+      };
+      freezoneSpeechUpdatedAt = 0;
       window.dispatchEvent(new CustomEvent('wizard-chess-freezone-voice', {
-        detail: { pieceId: piece.freeId, event: eventKey, voiceLines: piece.freeVoiceLines }
+        detail: {
+          roomCode,
+          pieceId: piece.freeId,
+          event: eventKey,
+          text: line.trim().slice(0, 120),
+          voiceId: piece.freeAIVoice || 'alloy',
+          voiceLines: piece.freeVoiceLines
+        }
       }));
     }
 
@@ -5280,6 +5801,9 @@ export function initWizardChess() {
         title: piece.freeTitle || piece.title || '',
         catchphrase: piece.freeCatchphrase || piece.catchphrase || '',
         description: piece.freeDescription || piece.description || '',
+        personality: piece.freePersonality || piece.personality || '',
+        language: piece.freeLanguage || piece.language || 'en-US',
+        aiVoice: piece.freeAIVoice || piece.aiVoice || 'alloy',
         appearance: piece.freeAppearance || piece.appearance || '',
         voiceLines: piece.freeVoiceLines || piece.voiceLines || {}
       });
@@ -5371,10 +5895,14 @@ export function initWizardChess() {
         title: hoveredPiece.freeTitle || '',
         catchphrase: hoveredPiece.freeCatchphrase || '',
         description: hoveredPiece.freeDescription || '',
+        personality: hoveredPiece.freePersonality || '',
+        language: hoveredPiece.freeLanguage || 'en-US',
+        aiVoice: hoveredPiece.freeAIVoice || 'alloy',
         appearance: hoveredPiece.freeAppearance || '',
         eliminations: Math.max(0, hoveredPiece.freeEliminations || 0),
         moves: hoveredPiece.freeMoves || [],
         jumps: hoveredPiece.freeJumps || [],
+        teleports: hoveredPiece.freeTeleports || [],
         slide: hoveredPiece.freeSlide === true,
         voiceLines: hoveredPiece.freeVoiceLines || {},
         side: hoveredPiece.freeSide,
@@ -5403,11 +5931,38 @@ export function initWizardChess() {
       const piece = Array.from(freePieces.values()).find((candidate) => candidate.freeSide === localSide);
       emitFreezoneVoice('inactivity', piece);
     }, 15000);
+    window.setInterval(updateFreezoneMutantTimer, 1000);
 
     function customMovesForPiece(piece) {
       if (!customGameConfig || !piece?.freeMoves) return [];
       const moves = [];
       const size = customGameConfig.boardSize;
+      if (customGameConfig.gameMode === 'freezone') {
+        const player = freezonePlayerState.get(piece.freeSide) || normalizeFreezonePlayer({});
+        const candidates = computeFreezoneMoves({
+          id: piece.freeId,
+          side: piece.freeSide,
+          r: piece.r,
+          c: piece.c,
+          moves: piece.freeMoves,
+          jumps: piece.freeJumps || [],
+          teleports: piece.freeTeleports || [],
+          slide: piece.freeSlide === true
+        }, {
+          boardSize: size,
+          envelopeRows: player.envelopeRows,
+          envelopeCols: player.envelopeCols,
+          stepsRemaining: Math.max(0, player.stepBudget - player.stepsUsed),
+          removedBlocks: Array.from(customRemovedBlocks, (key) => key.split(',').map(Number)),
+          pieces: Array.from(freePieces.values(), (other) => ({
+            id: other.freeId,
+            side: other.freeSide,
+            r: other.r,
+            c: other.c
+          }))
+        });
+        return candidates;
+      }
       for (const [dr, dc] of piece.freeMoves) {
         const isJump = piece.freeJumps?.some(([jr, jc]) => jr === dr && jc === dc);
         if (isJump) {
@@ -5435,6 +5990,119 @@ export function initWizardChess() {
         }
       }
       return moves;
+    }
+
+    function getFreezoneAICandidates(side, controlledPieceId) {
+      const candidates = [];
+      for (const piece of freePieces.values()) {
+        if (piece.freeSide !== side || piece.freeId === controlledPieceId) continue;
+        for (const move of customMovesForPiece(piece)) {
+          const from = { r: piece.r, c: piece.c };
+          const to = { r: move.r, c: move.c };
+          candidates.push({
+            id: freezoneAICandidateId(piece.freeId, from, to, move.kind),
+            pieceId: piece.freeId,
+            pieceName: piece.freeName || piece.type,
+            type: piece.type,
+            from,
+            to,
+            kind: move.kind,
+            stepCost: move.stepCost,
+            capture: move.capture
+          });
+        }
+      }
+      return candidates
+        .sort((left, right) => Number(right.capture) - Number(left.capture))
+        .slice(0, 128);
+    }
+
+    async function requestFreezoneBotAction(controlledPieceId, lastPlayerMove) {
+      if (gameMode !== 'multi' || customGameConfig?.gameMode !== 'freezone' ||
+          customPlayerIndex < 0 || !roomCode || freezoneAIDialogueBusy) return;
+      const side = customPlayerIndex;
+      const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
+      if (player.controlledPieceId !== controlledPieceId) return;
+      const candidates = getFreezoneAICandidates(side, controlledPieceId);
+      if (!candidates.length) {
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: 'Your AI-controlled pieces have no legal move right now.'
+        }));
+        return;
+      }
+
+      freezoneAIDialogueBusy = true;
+      try {
+        const response = await requestFreezoneAIMove({
+          roomCode,
+          playerToken,
+          controlledPieceId,
+          lastPlayerMove,
+          aiHistory: sanitizeFreezoneAIHistory(freeModeState?.aiHistory),
+          candidates
+        });
+        const decision = normalizeFreezoneAIDecision(
+          response,
+          candidates,
+          Array.from(freePieces.values())
+            .filter((piece) => piece.freeSide === side)
+            .map((piece) => piece.freeId)
+        );
+        if (!decision.ok) throw new Error(decision.error);
+        const currentPlayer = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
+        if (currentPlayer.controlledPieceId !== controlledPieceId) {
+          throw new Error('AI move canceled because the controlled piece changed.');
+        }
+        const currentCandidate = getFreezoneAICandidates(side, controlledPieceId)
+          .find((candidate) => candidate.id === decision.candidate.id);
+        if (!currentCandidate) {
+          throw new Error('AI move canceled because the position changed; try again.');
+        }
+        const dialogue = decision.lines.length
+          ? {
+            id: `ai-${roomCode}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            createdAt: Date.now(),
+            lines: decision.lines
+          }
+          : null;
+        handleCustomModeClick(
+          { clientX: -1, clientY: -1 },
+          {
+            pieceId: currentCandidate.pieceId,
+            r: currentCandidate.to.r,
+            c: currentCandidate.to.c,
+            kind: currentCandidate.kind,
+            aiDialogue: dialogue
+          }
+        );
+      } catch (error) {
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: error instanceof Error ? `AI action failed: ${error.message}` : 'AI action failed.'
+        }));
+      } finally {
+        freezoneAIDialogueBusy = false;
+      }
+    }
+
+    function focusFreezonePiece(piece) {
+      if (customGameConfig?.gameMode !== 'freezone' || !piece) return;
+      const target = freeBoardToWorld(piece.r, piece.c);
+      target.y += 0.45;
+      const startTarget = orbitControls.target.clone();
+      const pose = freezoneFocusPose(
+        camera.position.toArray(),
+        startTarget.toArray(),
+        target.toArray()
+      );
+      const endPos = new THREE.Vector3(...pose.position);
+      activeCamTransition = {
+        startPos: camera.position.clone(),
+        endPos,
+        startTarget,
+        endTarget: new THREE.Vector3(...pose.target),
+        elapsed: 0,
+        duration: 0.7
+      };
     }
 
     function advanceCustomTurn() {
@@ -5490,7 +6158,8 @@ export function initWizardChess() {
       mesh.instanceMatrix.needsUpdate = true;
     }
 
-    function handleCustomModeClick(event) {
+    function handleCustomModeClick(event, forcedMove = null) {
+      if (isAnimatingMove || (freezoneAIDialogueBusy && !forcedMove)) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
@@ -5512,6 +6181,19 @@ export function initWizardChess() {
         }
       }
 
+      if (forcedMove) {
+        const aiPiece = freePieces.get(forcedMove.pieceId);
+        if (!aiPiece || aiPiece.freeSide !== customPlayerIndex) {
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: 'AI move rejected because its piece is no longer available.'
+          }));
+          return;
+        }
+        selectedFreePieceId = aiPiece.freeId;
+        hitPiece = null;
+        hitSquare = { r: forcedMove.r, c: forcedMove.c };
+      }
+
       if (!hitPiece && !hitSquare) {
         const surfaceY = customGameConfig.gameMode === 'freezone' ? FREE_FLOOR_Y : BOARD_SURFACE_Y;
         const floorPlane = new THREE.Plane(
@@ -5527,7 +6209,7 @@ export function initWizardChess() {
         }
       }
 
-      if (freeBlockRemoval) {
+      if (freeBlockRemoval && !forcedMove) {
         if (!hitSquare || freePieceAt(hitSquare.r, hitSquare.c)) return;
         const key = freeCellKey(hitSquare.r, hitSquare.c);
         const wasRemoved = customRemovedBlocks.has(key);
@@ -5541,6 +6223,13 @@ export function initWizardChess() {
           customPlayerIndex !== customTurnIndex) return;
       const selectedPiece = freePieces.get(selectedFreePieceId);
       if (hitPiece) {
+        if (customGameConfig.gameMode === 'freezone' &&
+            selectedPiece === hitPiece &&
+            customMovesForPiece(selectedPiece).some((move) =>
+              move.kind === 'teleport' && move.r === hitPiece.r && move.c === hitPiece.c
+            )) {
+          hitSquare = { r: hitPiece.r, c: hitPiece.c };
+        } else
         if (selectedPiece && hitPiece.freeSide !== selectedPiece.freeSide) {
           const allowed = customMovesForPiece(selectedPiece).some(
             (move) => move.r === hitPiece.r && move.c === hitPiece.c
@@ -5549,7 +6238,16 @@ export function initWizardChess() {
           hitSquare = { r: hitPiece.r, c: hitPiece.c };
         } else {
           if (gameMode === 'multi' && hitPiece.freeSide !== customPlayerIndex) return;
+          activeCamTransition = null;
           selectedFreePieceId = hitPiece.freeId;
+          if (customGameConfig.gameMode === 'freezone') {
+            const player = freezonePlayerState.get(hitPiece.freeSide) || normalizeFreezonePlayer({});
+            if (player.controlledPieceId !== hitPiece.freeId) {
+              player.controlledPieceId = hitPiece.freeId;
+              freezonePlayerState.set(hitPiece.freeSide, player);
+              persistFreeModeState();
+            }
+          }
           showSquareHighlights(hitPiece.r, hitPiece.c, customMovesForPiece(hitPiece));
           if (customGameConfig.gameMode === 'freezone') {
             const details = [
@@ -5566,18 +6264,35 @@ export function initWizardChess() {
           return;
         }
       }
-      if (!hitSquare || !selectedPiece) return;
+      if (!hitSquare) {
+        if (selectedPiece && customGameConfig.gameMode !== 'freezone') {
+          selectedFreePieceId = null;
+          clearSquareHighlights();
+        }
+        return;
+      }
+      if (!selectedPiece) return;
       const move = customMovesForPiece(selectedPiece).find(
         (candidate) => candidate.r === hitSquare.r && candidate.c === hitSquare.c
       );
-      if (!move) return;
+      if (!move) {
+        if (forcedMove) {
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: 'AI move rejected because it is no longer legal.'
+          }));
+        }
+        return;
+      }
       if (customGameConfig.gameMode === 'freezone' &&
           !canMoveFreezonePiece(selectedPiece.freeSide)) return;
 
       const from = selectedPiece.mesh.position.clone();
+      const fromSquare = { r: selectedPiece.r, c: selectedPiece.c };
       const to = freeBoardToWorld(move.r, move.c);
       const movingPieceId = selectedPiece.freeId;
-      const captured = freePieceAt(move.r, move.c);
+      const destinationOccupant = freePieceAt(move.r, move.c);
+      const captured = destinationOccupant === selectedPiece ? null : destinationOccupant;
+      const animateCapture = Boolean(captured && customGameConfig.gameMode === 'freezone');
       let removedPieces = [];
       if (captured) {
         if (customGameConfig.gameMode === 'freezone') {
@@ -5590,7 +6305,23 @@ export function initWizardChess() {
           ? Array.from(freePieces.values()).filter((piece) => piece.freeSide === eliminatedSide)
           : [captured];
         removedPieces = capturedPieces;
+        if (customGameConfig.gameMode === 'freezone') {
+          emitFreezoneVoice('capture', selectedPiece);
+          emitFreezoneVoice('death', captured);
+          const ally = Array.from(freePieces.values()).find((piece) =>
+            piece !== captured && piece.freeSide === captured.freeSide
+          );
+          if (ally) emitFreezoneVoice('allyDeath', ally);
+        }
         for (const capturedPiece of capturedPieces) {
+          if (animateCapture && capturedPiece === captured) continue;
+          if (customGameConfig.gameMode === 'freezone') {
+            const capturedPlayer = freezonePlayerState.get(capturedPiece.freeSide);
+            if (capturedPlayer?.controlledPieceId === capturedPiece.freeId) {
+              capturedPlayer.controlledPieceId = '';
+              freezonePlayerState.set(capturedPiece.freeSide, capturedPlayer);
+            }
+          }
           scene.remove(capturedPiece.mesh);
           freePieces.delete(capturedPiece.freeId);
         }
@@ -5605,10 +6336,43 @@ export function initWizardChess() {
       isAnimatingMove = true;
       let elapsed = 0;
       const duration = Math.max(0.35, Math.min(1.1, from.distanceTo(to) * 0.35));
+      let attackTriggered = false;
+      let impactTriggered = false;
+      const strikePoint = from.clone().lerp(to, 0.58);
       activeMoveTweens.push((dt) => {
         elapsed += dt;
         const progress = Math.min(1, elapsed / duration);
-        selectedPiece.mesh.position.lerpVectors(from, to, easeInOutCubic(progress));
+        if (animateCapture) {
+          const capturePhase = freezoneCapturePhase(progress);
+          if (!attackTriggered && capturePhase !== 'approach') {
+            attackTriggered = true;
+            playPieceClip(selectedPiece, 'Attack', false, 0.08);
+          }
+          if (!impactTriggered &&
+              (capturePhase === 'advance' || capturePhase === 'complete')) {
+            impactTriggered = true;
+            playPieceClip(captured, 'Shatter', false, 0.04);
+            const impactPosition = captured.mesh.position.clone();
+            scene.remove(captured.mesh);
+            freePieces.delete(captured.freeId);
+            spawnStoneShatter(impactPosition, captured.color);
+          }
+          if (progress < 0.58) {
+            selectedPiece.mesh.position.lerpVectors(
+              from,
+              strikePoint,
+              easeInOutCubic(progress / 0.58)
+            );
+          } else {
+            selectedPiece.mesh.position.lerpVectors(
+              strikePoint,
+              to,
+              easeInOutCubic((progress - 0.58) / 0.42)
+            );
+          }
+        } else {
+          selectedPiece.mesh.position.lerpVectors(from, to, easeInOutCubic(progress));
+        }
         if (progress < 1) return false;
         selectedPiece.r = move.r;
         selectedPiece.c = move.c;
@@ -5616,18 +6380,79 @@ export function initWizardChess() {
         playPieceClip(selectedPiece, 'Idle', true, 0.15);
         isAnimatingMove = false;
         if (customGameConfig.gameMode === 'freezone') {
-          recordFreezoneMove(selectedPiece.freeSide);
+          recordFreezoneMove(selectedPiece.freeSide, move.stepCost, movingPieceId);
+          emitFreezoneVoice('move', selectedPiece);
           collectFreezoneOrbsAt(move.r, move.c, selectedPiece.freeSide);
           checkFreezoneVulnerability(selectedPiece);
         }
-        selectedFreePieceId = movingPieceId;
+        const player = customGameConfig.gameMode === 'freezone'
+          ? freezonePlayerState.get(selectedPiece.freeSide)
+          : null;
+        const controlledPiece = player?.controlledPieceId
+          ? freePieces.get(player.controlledPieceId)
+          : null;
+        selectedFreePieceId = controlledPiece?.freeSide === selectedPiece.freeSide
+          ? controlledPiece.freeId
+          : movingPieceId;
         advanceCustomTurn();
-        selectedFreePieceId = null;
         if (customGameConfig.gameMode === 'freezone') {
+          const focusPiece = freePieces.get(selectedFreePieceId) || selectedPiece;
+          showSquareHighlights(
+            focusPiece.r,
+            focusPiece.c,
+            customMovesForPiece(focusPiece)
+          );
+          focusFreezonePiece(focusPiece);
           publishFreezoneHud();
           emitFreezoneOutcomeIfEnded(removedPieces);
+        } else {
+          selectedFreePieceId = null;
         }
-        persistFreeModeState();
+        if (forcedMove?.aiDialogue) {
+          const historyEntries = forcedMove.aiDialogue.lines.map((line, index) => {
+            const speaker = freePieces.get(line.pieceId);
+            return {
+              id: `${forcedMove.aiDialogue.id}:${index}`,
+              pieceId: line.pieceId,
+              name: speaker?.freeName || speaker?.type || '',
+              side: Number.isInteger(speaker?.freeSide) ? speaker.freeSide : -1,
+              kind: 'exchange',
+              text: line.text,
+              createdAt: forcedMove.aiDialogue.createdAt
+            };
+          });
+          freeModeState = {
+            ...(freeModeState || {}),
+            aiDialogue: forcedMove.aiDialogue,
+            aiHistory: sanitizeFreezoneAIHistory([
+              ...(freeModeState?.aiHistory || []),
+              ...historyEntries
+            ])
+          };
+        }
+        const saveResult = persistFreeModeState();
+        if (customGameConfig.gameMode === 'freezone' && forcedMove) {
+          if (forcedMove.aiDialogue) {
+            void saveResult.then((result) => {
+              if (!result.ok) return;
+              queueFreezoneAIDialogue(forcedMove.aiDialogue);
+            });
+          }
+        } else if (customGameConfig.gameMode === 'freezone') {
+          void saveResult.then((result) => {
+            if (!result.ok) return;
+            void requestFreezoneBotAction(movingPieceId, {
+              pieceName: selectedPiece.freeName || selectedPiece.type,
+              from: fromSquare,
+              to: { r: move.r, c: move.c },
+              capture: Boolean(captured),
+              capturedPiece: captured ? {
+                name: captured.freeName || captured.type,
+                type: captured.type
+              } : null
+            });
+          });
+        }
         return true;
       });
     }
@@ -6039,7 +6864,7 @@ export function initWizardChess() {
       const token = ensurePlayerToken();
       const state = createCustomModeState({
         version: 1,
-        boardSize: 32,
+        boardSize: FREEZONE_BOARD_SIZE,
         playerCount: 10,
         gameMode: 'freezone',
         piecesPerPlayer: 2,
@@ -6073,7 +6898,7 @@ export function initWizardChess() {
     async function createFreezoneRoom() {
       return createCustomRoom({
         version: 1,
-        boardSize: 32,
+        boardSize: FREEZONE_BOARD_SIZE,
         playerCount: 10,
         gameMode: 'freezone',
         piecesPerPlayer: 2,
@@ -6177,18 +7002,12 @@ export function initWizardChess() {
     // =========================================================================
     // Camera Presets & HUD Controls
     // =========================================================================
-    const camButtons = [
-      'btn-cam-player',
-      'btn-cam-top',
-      'btn-cam-side',
-      'btn-cam-wide'
-    ];
+    let activeCameraPreset = 'player';
 
-    function setActiveCamButton(activeId) {
-      for (const id of camButtons) {
-        const el = document.getElementById(id);
-        if (el) el.classList.toggle('active', id === activeId);
-      }
+    function setActiveCameraPreset(preset) {
+      activeCameraPreset = preset;
+      const select = document.getElementById('camera-preset-select');
+      if (select) select.value = preset;
     }
 
     let playerCamSide = 'w';     // toggles 'w' (White) <-> 'b' (Black) on repeat click of Player Cam
@@ -6210,42 +7029,42 @@ export function initWizardChess() {
 
     function setCameraPreset(preset) {
       if (preset === 'player') {
-        const wasPlayerActive = document.getElementById('btn-cam-player')?.classList.contains('active');
+        const wasPlayerActive = activeCameraPreset === 'player';
         if (wasPlayerActive) {
           playerCamSide = playerCamSide === 'w' ? 'b' : 'w';
         } else {
           playerCamSide = playerColor === 'b' ? 'b' : 'w';
         }
-        setActiveCamButton('btn-cam-player');
+        setActiveCameraPreset('player');
         setCameraForSide(playerCamSide, false);
       } else if (preset === 'top') {
-        const wasTopActive = document.getElementById('btn-cam-top')?.classList.contains('active');
+        const wasTopActive = activeCameraPreset === 'top';
         if (wasTopActive) {
           overheadCamSide = overheadCamSide === 'w' ? 'b' : 'w';
         } else {
           overheadCamSide = playerColor === 'b' ? 'b' : 'w';
         }
-        setActiveCamButton('btn-cam-top');
+        setActiveCameraPreset('top');
         const zSign = overheadCamSide === 'b' ? -1 : 1;
         smoothCameraTo(new THREE.Vector3(0, 6.85, zSign * 3.65), new THREE.Vector3(0, 0.78, 0), 0.75);
       } else if (preset === 'side') {
-        const wasSideActive = document.getElementById('btn-cam-side')?.classList.contains('active');
+        const wasSideActive = activeCameraPreset === 'side';
         if (wasSideActive) {
           sideCamSide = sideCamSide === 'east' ? 'west' : 'east';
         } else {
           sideCamSide = 'east';
         }
-        setActiveCamButton('btn-cam-side');
+        setActiveCameraPreset('side');
         const xSign = sideCamSide === 'west' ? -1 : 1;
         smoothCameraTo(new THREE.Vector3(xSign * 2.85, 1.85, 0), new THREE.Vector3(0, 0.84, 0), 0.75);
       } else if (preset === 'wide') {
-        const wasWideActive = document.getElementById('btn-cam-wide')?.classList.contains('active');
+        const wasWideActive = activeCameraPreset === 'wide';
         if (wasWideActive) {
           cathedralWideSide = cathedralWideSide === 'north' ? 'south' : 'north';
         } else {
           cathedralWideSide = playerColor === 'b' ? 'south' : 'north';
         }
-        setActiveCamButton('btn-cam-wide');
+        setActiveCameraPreset('wide');
         if (cathedralWideSide === 'south') {
           // Black's wide Cathedral perspective looking South toward the Narthex Triptych (chessboard centered in frame)
           smoothCameraTo(new THREE.Vector3(0, 2.55, -6.65), new THREE.Vector3(0, 1.95, 2.50), 0.85);
@@ -6266,10 +7085,9 @@ export function initWizardChess() {
       }
     }
 
-    document.getElementById('btn-cam-player')?.addEventListener('click', () => setCameraPreset('player'));
-    document.getElementById('btn-cam-top')?.addEventListener('click', () => setCameraPreset('top'));
-    document.getElementById('btn-cam-side')?.addEventListener('click', () => setCameraPreset('side'));
-    document.getElementById('btn-cam-wide')?.addEventListener('click', () => setCameraPreset('wide'));
+    document.getElementById('camera-preset-select')?.addEventListener('change', (event) => {
+      setCameraPreset(event.currentTarget.value);
+    });
     document.getElementById('btn-hide-ui')?.addEventListener('click', () => toggleUI());
 
     document.getElementById('btn-script-modal')?.addEventListener('click', () => openLobbyModal('script'));
@@ -6467,6 +7285,7 @@ export function initWizardChess() {
       setCameraPreset,
       setCameraPose,
       setCameraLook: setCameraPose,
+      leaveCurrentGame,
       setCameraKeySpeedPercent,
       setCameraRotSpeedPercent,
       setWallStoneLook,
@@ -6493,6 +7312,8 @@ export function initWizardChess() {
       joinFreezoneRoom,
       buyFreezonePiece,
       upgradeFreezoneSkill,
+      upgradeFreezoneEnvelope,
+      setFreezoneSharedMusicUrl,
       createMultiplayerRoom,
       joinMultiplayerRoom,
       quickMatch,
@@ -6768,6 +7589,16 @@ export function initWizardChess() {
       for (const mixer of activeMixers) {
         mixer.update(dt);
       }
+      for (const orb of freezoneOrbMeshes.values()) {
+        const pulse = 1 + Math.sin(elapsedTotal * 2.4 + orb.userData.phase) * 0.1;
+        orb.position.y = orb.userData.baseY + Math.sin(elapsedTotal * 1.6 + orb.userData.phase) * 0.035;
+        orb.rotation.y += dt * 0.55;
+        for (const child of orb.children) {
+          if (child.userData.freezoneOrbGlow) child.scale.setScalar(pulse * 1.35);
+          if (child.userData.freezoneOrbCore) child.scale.setScalar(pulse);
+        }
+      }
+      if (customGameConfig?.gameMode === 'freezone') updateFreezoneSpeech();
 
       // Feature 3c: Advance pre-move piece selection & valid-squares highlight beat before executing scripted move
       if (preMoveHighlightTask && !isAnimatingMove) {
@@ -6872,9 +7703,7 @@ export function initWizardChess() {
           }
 
           if (heldCameraKeys.size > 0) {
-            document
-              .querySelectorAll('#btn-cam-player, #btn-cam-wide, #btn-cam-top, #btn-cam-side')
-              .forEach((b) => b.classList.remove('active'));
+            setActiveCameraPreset('custom');
           }
         }
       }

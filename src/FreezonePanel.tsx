@@ -1,16 +1,34 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import FreezoneAppearancePreview from './FreezoneAppearancePreview';
 import {
+  FREEZONE_AI_LANGUAGES,
+  FREEZONE_AI_VOICES,
   FREEZONE_APPEARANCES,
   FREEZONE_VOICE_EVENTS,
   resolveFreezoneVoice,
   shouldSpeakFreezoneVoice
 } from './freezoneCustomization.js';
+import { shouldRequestFreezoneAIVoice } from './freezoneAi.js';
+import { requestFreezoneSpeech } from './multiplayerSupabase.js';
+import {
+  clearFreezoneAIKeys,
+  getFreezoneAISettings,
+  updateFreezoneAISettings
+} from './freezoneAISettings.js';
+import {
+  FREEZONE_ENVELOPE_OPTIONS,
+  canUpgradeFreezoneEnvelope,
+  validateFreezoneAudioFile,
+  validateFreezoneAudioUrl
+} from './freezoneRules.js';
 
 type PieceType = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen';
 type MoveOffset = [number, number];
-type VoiceEventKey = 'entry' | 'inactivity' | 'inspection' | 'victory' | 'defeat' | 'vulnerable';
+type VoiceEventKey =
+  | 'entry' | 'move' | 'capture' | 'death' | 'allyDeath' | 'purchase' | 'upgrade'
+  | 'inactivity' | 'inspection' | 'victory' | 'defeat' | 'vulnerable';
 type PieceVoiceLines = Record<VoiceEventKey, string>;
+type AIProviderKey = 'gemini' | 'openai' | 'deepseek' | 'google';
 
 type FreezoneRoom = {
   id: string;
@@ -30,10 +48,14 @@ export type FreezonePattern = {
   catchphrase: string;
   appearance: string;
   description: string;
+  personality: string;
+  language: string;
+  aiVoice: string;
   voiceLines: PieceVoiceLines;
   type: PieceType;
   moves: MoveOffset[];
   jumps: MoveOffset[];
+  teleports: MoveOffset[];
   slide: boolean;
 };
 
@@ -43,10 +65,14 @@ type FreezoneOwnedPiece = {
   title: string;
   catchphrase: string;
   description: string;
+  personality: string;
+  language: string;
+  aiVoice: string;
   appearance: string;
   eliminations: number;
   moves: MoveOffset[];
   jumps: MoveOffset[];
+  teleports: MoveOffset[];
   slide: boolean;
   voiceLines: PieceVoiceLines;
   type: PieceType | 'king';
@@ -56,9 +82,10 @@ type FreezoneInspectedPiece = FreezoneOwnedPiece & {
   x: number;
   y: number;
 };
+type FreezoneSpeechBubble = { text: string; x: number; y: number };
 
 type FreezoneOrbEffect = {
-  type: 'xp' | 'red' | 'yellow' | 'purple' | 'white';
+  type: 'xp' | 'red' | 'blue' | 'yellow' | 'purple' | 'white';
   label: string;
   description: string;
   color: string;
@@ -77,8 +104,14 @@ type FreezoneHud = {
   movesPerCycle: number;
   cooldownDurationMs: number;
   editorRange: number;
+  envelopeRows: number;
+  envelopeCols: number;
+  stepBudget: number;
+  stepsUsed: number;
+  mutantZone?: { shape: 'diamond' | 'triangle' | 'circle'; remainingMs: number } | null;
+  sharedMusicUrl?: string;
   maxPatternOffsets: number;
-  upgradeLevels: { red: number; yellow: number; purple: number; white: number };
+  upgradeLevels: { red: number; blue: number; yellow: number; purple: number; white: number };
   orbBalances: Record<FreezoneOrbEffect['type'], number>;
   canUpgrade: Record<FreezoneUpgrade, boolean>;
   ownedPieces: FreezoneOwnedPiece[];
@@ -94,6 +127,7 @@ type FreezoneHud = {
 
 type FreezoneApiResult = { ok: boolean; code?: string; error?: string };
 type FreezonePatternInput = Omit<FreezonePattern, 'id'> | FreezonePattern;
+type FreezonePanelProps = { mainMenuOpen: boolean };
 
 function readLocalSetting(key: string, fallback = '') {
   try {
@@ -115,26 +149,33 @@ const PIECE_TYPES: { type: PieceType; label: string }[] = [
   { type: 'bishop', label: 'Bishop' },
   { type: 'queen', label: 'Queen' }
 ];
-const FREEZONE_UPGRADES: { type: FreezoneUpgrade; label: string; description: string }[] = [
-  { type: 'red', label: 'Move budget', description: '+1 action before resting' },
+const FREEZONE_UPGRADES: { type: Exclude<FreezoneUpgrade, 'white'>; label: string; description: string }[] = [
+  { type: 'red', label: 'Move actions', description: '+1 move action per cycle' },
+  { type: 'blue', label: 'Unit-step budget', description: '+2 unit steps per cycle' },
   { type: 'yellow', label: 'Cooldown', description: 'Reduce rest by 0.3 seconds' },
-  { type: 'purple', label: 'Army capacity', description: '+1 piece slot' },
-  { type: 'white', label: 'Editor reach', description: '+1 tile of movement-design range' }
+  { type: 'purple', label: 'Army capacity', description: '+1 piece slot' }
 ];
 
-function movementText(moves: MoveOffset[], jumps: MoveOffset[], slide: boolean) {
+function movementText(
+  moves: MoveOffset[],
+  jumps: MoveOffset[],
+  teleports: MoveOffset[],
+  slide: boolean
+) {
   const directions = moves
     .map(([row, col], index) => {
       const jump = jumps.some(([jumpRow, jumpCol]) => jumpRow === row && jumpCol === col);
-      return `${index + 1}${jump ? ' jump' : ''}: ${row > 0 ? '+' : ''}${row},${col > 0 ? '+' : ''}${col}`;
+      const teleport = teleports.some(([moveRow, moveCol]) => moveRow === row && moveCol === col);
+      return `${index + 1} ${teleport ? 'teleport' : jump ? 'jump' : 'drag'}: ${row > 0 ? '+' : ''}${row},${col > 0 ? '+' : ''}${col}`;
     })
     .join(' · ');
   return `${slide ? 'Sliding' : 'Step'}: ${directions}`;
 }
 
-export default function FreezonePanel() {
+export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [hud, setHud] = useState<FreezoneHud | null>(null);
   const [open, setOpen] = useState(false);
+  const activeFreezoneHudRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [roomCode, setRoomCode] = useState('');
@@ -148,16 +189,27 @@ export default function FreezonePanel() {
   const [pieceName, setPieceName] = useState('');
   const [pieceTitle, setPieceTitle] = useState('');
   const [pieceDescription, setPieceDescription] = useState('');
+  const [piecePersonality, setPiecePersonality] = useState('');
+  const [pieceLanguage, setPieceLanguage] = useState('en-US');
+  const [pieceAIVoice, setPieceAIVoice] = useState('alloy');
   const [pieceCatchphrase, setPieceCatchphrase] = useState('');
   const [appearance, setAppearance] = useState(FREEZONE_APPEARANCES[0].id);
   const [voiceLines, setVoiceLines] = useState<PieceVoiceLines>({
-    entry: '', inactivity: '', inspection: '', victory: '', defeat: '', vulnerable: ''
+    entry: '', move: '', capture: '', death: '', allyDeath: '', purchase: '', upgrade: '',
+    inactivity: '', inspection: '', victory: '', defeat: '', vulnerable: ''
   });
   const [inspectedPiece, setInspectedPiece] = useState<FreezoneInspectedPiece | null>(null);
+  const [speechBubble, setSpeechBubble] = useState<FreezoneSpeechBubble | null>(null);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceEnabled, setVoiceEnabled] = useState(
     () => readLocalSetting('freezone-voice-enabled') === 'true'
   );
+  const [aiVoiceEnabled, setAIVoiceEnabled] = useState(
+    () => readLocalSetting('freezone-ai-voice-enabled') === 'true'
+  );
+  const [aiSettings, setAISettings] = useState(() => getFreezoneAISettings());
+  const [aiVoiceStatus, setAIVoiceStatus] = useState('');
+  const [aiVoiceReady, setAIVoiceReady] = useState(false);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState(
     () => readLocalSetting('freezone-voice-uri')
   );
@@ -168,11 +220,38 @@ export default function FreezonePanel() {
   const [pendingReplacement, setPendingReplacement] = useState<FreezonePatternInput | null>(null);
   const [selectedMoves, setSelectedMoves] = useState<MoveOffset[]>([]);
   const [selectedJumps, setSelectedJumps] = useState<MoveOffset[]>([]);
+  const [selectedTeleports, setSelectedTeleports] = useState<MoveOffset[]>([]);
+  const [targetEnvelope, setTargetEnvelope] = useState({ rows: 2, cols: 3 });
   const [slide, setSlide] = useState(false);
   const noticeTimer = useRef<number | null>(null);
   const musicRef = useRef<HTMLAudioElement | null>(null);
   const localMusicUrl = useRef('');
+  const aiVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const aiVoiceUrlRef = useRef('');
+  const aiVoiceQueueRef = useRef(Promise.resolve());
+  const aiVoiceEnabledRef = useRef(aiVoiceEnabled);
   const voiceCooldowns = useRef(new Map<string, number>());
+
+  const updateAISettings = (change: Partial<ReturnType<typeof getFreezoneAISettings>>) => {
+    const next = {
+      ...aiSettings,
+      ...change,
+      apiKeys: { ...aiSettings.apiKeys, ...(change.apiKeys || {}) }
+    };
+    setAISettings(next);
+    updateFreezoneAISettings(next);
+  };
+
+  const updateAIKey = (provider: AIProviderKey, value: string) => {
+    updateAISettings({ apiKeys: { ...aiSettings.apiKeys, [provider]: value } });
+  };
+
+  const clearAIKeys = () => {
+    clearFreezoneAIKeys();
+    const apiKeys = { gemini: '', openai: '', deepseek: '', google: '' };
+    setAISettings((current) => ({ ...current, apiKeys }));
+    setAIVoiceStatus('API keys cleared from this session.');
+  };
 
   useEffect(() => {
     if (!('speechSynthesis' in window)) return undefined;
@@ -198,36 +277,138 @@ export default function FreezonePanel() {
       utterance.voice = voice || voices[0] || null;
       window.speechSynthesis.speak(utterance);
     };
+    const reportAIVoiceStatus = (message: string) => {
+      setAIVoiceStatus(message);
+      window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+        detail: message
+      }));
+    };
+    const queueGeneratedVoice = (detail: {
+      roomCode?: string;
+      dialogueId?: string;
+      pieceId: string;
+      event?: VoiceEventKey;
+      text: string;
+      voiceId?: string;
+    }) => {
+      if (!detail.roomCode ||
+          !shouldRequestFreezoneAIVoice(
+            aiVoiceEnabled, detail.text, detail.voiceId, aiSettings.voiceProvider
+          )) return;
+      const cooldownKey = `ai:${detail.dialogueId || detail.event || 'line'}:${detail.pieceId}`;
+      const now = Date.now();
+      if (now - (voiceCooldowns.current.get(cooldownKey) || 0) < 30000) return;
+      voiceCooldowns.current.set(cooldownKey, now);
+      if (voiceCooldowns.current.size > 512) {
+        const oldestKey = voiceCooldowns.current.keys().next().value;
+        if (oldestKey) voiceCooldowns.current.delete(oldestKey);
+      }
+      aiVoiceQueueRef.current = aiVoiceQueueRef.current.then(async () => {
+        if (!aiVoiceEnabledRef.current) return;
+        const playerToken = readLocalSetting('wizard_chess_token');
+        if (!playerToken) {
+          reportAIVoiceStatus('Join the Freezone room before requesting character voice.');
+          return;
+        }
+        try {
+          const blob = await requestFreezoneSpeech({
+            roomCode: detail.roomCode,
+            playerToken,
+            dialogueId: detail.dialogueId,
+            pieceId: detail.pieceId,
+            event: detail.event,
+            text: detail.text
+          });
+          if (!aiVoiceEnabledRef.current) return;
+          if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
+          const url = URL.createObjectURL(blob);
+          aiVoiceUrlRef.current = url;
+          setAIVoiceReady(true);
+          setAIVoiceStatus('Character voice is ready.');
+          const audio = aiVoiceAudioRef.current;
+          if (audio) {
+            audio.src = url;
+            audio.load();
+            try {
+              await audio.play();
+            } catch {
+              reportAIVoiceStatus('Autoplay was blocked. Use “Play latest voice” to listen.');
+            }
+          }
+        } catch (error) {
+          reportAIVoiceStatus(error instanceof Error ? error.message : 'Character voice could not be generated.');
+        }
+      }).catch((error: unknown) => {
+        reportAIVoiceStatus(error instanceof Error ? error.message : 'Character voice could not be generated.');
+      });
+    };
     const handleVoice = (event: Event) => {
       const detail = (event as CustomEvent<{
+        roomCode?: string;
         pieceId: string;
         event: VoiceEventKey;
+        text?: string;
+        voiceId?: string;
         voiceLines: PieceVoiceLines;
       }>).detail;
-      if (detail) speak(detail.pieceId, detail.event, detail.voiceLines);
+      if (!detail) return;
+      if (!aiVoiceEnabled) speak(detail.pieceId, detail.event, detail.voiceLines);
+      if (detail.text) {
+        queueGeneratedVoice({
+          roomCode: detail.roomCode,
+          pieceId: detail.pieceId,
+          event: detail.event,
+          text: detail.text,
+          voiceId: detail.voiceId
+        });
+      }
     };
     const handleInspect = (event: Event) => {
       const detail = (event as CustomEvent<FreezoneInspectedPiece | null>).detail;
       setInspectedPiece(detail);
     };
+    const handleSpeech = (event: Event) => {
+      const detail = (event as CustomEvent<FreezoneSpeechBubble | null>).detail;
+      setSpeechBubble(detail);
+    };
+    const handleAIVoice = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        roomCode: string;
+        dialogueId: string;
+        pieceId: string;
+        text: string;
+        voiceId: string;
+      } | null>).detail;
+      if (detail) queueGeneratedVoice(detail);
+    };
     window.addEventListener('wizard-chess-freezone-voice', handleVoice);
     window.addEventListener('wizard-chess-freezone-inspect', handleInspect);
+    window.addEventListener('wizard-chess-freezone-speech', handleSpeech);
+    window.addEventListener('wizard-chess-freezone-ai-voice', handleAIVoice);
     return () => {
       window.removeEventListener('wizard-chess-freezone-voice', handleVoice);
       window.removeEventListener('wizard-chess-freezone-inspect', handleInspect);
+      window.removeEventListener('wizard-chess-freezone-speech', handleSpeech);
+      window.removeEventListener('wizard-chess-freezone-ai-voice', handleAIVoice);
     };
-  }, [selectedVoiceURI, voiceEnabled, voices]);
+  }, [aiSettings.voiceProvider, aiVoiceEnabled, selectedVoiceURI, voiceEnabled, voices]);
+
+  useEffect(() => {
+    aiVoiceEnabledRef.current = aiVoiceEnabled;
+    if (!aiVoiceEnabled) aiVoiceAudioRef.current?.pause();
+  }, [aiVoiceEnabled]);
 
   useEffect(() => {
     try {
       window.localStorage.setItem('freezone-voice-enabled', String(voiceEnabled));
+      window.localStorage.setItem('freezone-ai-voice-enabled', String(aiVoiceEnabled));
       window.localStorage.setItem('freezone-voice-uri', selectedVoiceURI);
       window.localStorage.setItem('freezone-music-url', /^https?:\/\//i.test(musicSource) ? musicSource : '');
       window.localStorage.setItem('freezone-music-volume', String(musicVolume));
     } catch {
       setStatus('Browser storage is unavailable; audio preferences will last only for this visit.');
     }
-  }, [musicSource, musicVolume, selectedVoiceURI, voiceEnabled]);
+  }, [aiVoiceEnabled, musicSource, musicVolume, selectedVoiceURI, voiceEnabled]);
 
   useEffect(() => {
     const audio = musicRef.current;
@@ -254,15 +435,26 @@ export default function FreezonePanel() {
 
   useEffect(() => () => {
     musicRef.current?.pause();
+    aiVoiceAudioRef.current?.pause();
     if (localMusicUrl.current) URL.revokeObjectURL(localMusicUrl.current);
+    if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   }, []);
 
   useEffect(() => {
     const handleFreezoneState = (event: Event) => {
       const detail = (event as CustomEvent<FreezoneHud>).detail;
-      setHud(detail?.enabled ? detail : null);
+      const enabled = detail?.enabled === true;
+      const wasEnabled = activeFreezoneHudRef.current;
+      activeFreezoneHudRef.current = enabled;
+      setHud(enabled ? detail : null);
+      if (enabled !== wasEnabled) setOpen(false);
       if (detail?.roomCode) setRoomCode(detail.roomCode);
+      if (detail?.sharedMusicUrl !== undefined) setMusicUrl(detail.sharedMusicUrl);
+    };
+    const handleOpenArena = () => {
+      setStatus('');
+      setOpen(true);
     };
     const handleNotice = (event: Event) => {
       const message = (event as CustomEvent<string>).detail;
@@ -271,11 +463,20 @@ export default function FreezonePanel() {
       if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
       noticeTimer.current = window.setTimeout(() => setNotice(''), 3500);
     };
+    const handleSharedMusic = (event: Event) => {
+      const url = (event as CustomEvent<string>).detail || '';
+      setMusicUrl(url);
+      if (!localMusicUrl.current) setMusicSource(url);
+    };
     window.addEventListener('wizard-chess-freezone-state', handleFreezoneState);
+    window.addEventListener('wizard-chess-open-freezone', handleOpenArena);
     window.addEventListener('wizard-chess-freezone-notice', handleNotice);
+    window.addEventListener('wizard-chess-freezone-music', handleSharedMusic);
     return () => {
       window.removeEventListener('wizard-chess-freezone-state', handleFreezoneState);
+      window.removeEventListener('wizard-chess-open-freezone', handleOpenArena);
       window.removeEventListener('wizard-chess-freezone-notice', handleNotice);
+      window.removeEventListener('wizard-chess-freezone-music', handleSharedMusic);
       if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
     };
   }, []);
@@ -335,12 +536,30 @@ export default function FreezonePanel() {
         ? {
           ...current,
           cooldownMs: Math.max(0, current.cooldownMs - 250),
-          movesUsed: current.cooldownMs <= 250 ? 0 : current.movesUsed
+          movesUsed: current.cooldownMs <= 250 ? 0 : current.movesUsed,
+          mutantZone: current.mutantZone
+            ? {
+              ...current.mutantZone,
+              remainingMs: Math.max(0, current.mutantZone.remainingMs - 250)
+            }
+            : null
         }
         : current);
     }, 250);
     return () => window.clearInterval(timer);
   }, [hud?.enabled]);
+
+  useEffect(() => {
+    if (!hud) return;
+    const choices = FREEZONE_ENVELOPE_OPTIONS.filter((option) =>
+      canUpgradeFreezoneEnvelope(hud.envelopeRows, hud.envelopeCols, option.rows, option.cols)
+    );
+    setTargetEnvelope((current) =>
+      choices.some((option) => option.rows === current.rows && option.cols === current.cols)
+        ? current
+        : choices[0] || current
+    );
+  }, [hud?.envelopeRows, hud?.envelopeCols]);
 
   const createArena = async () => {
     const action = window.wizardChess?.createFreezoneRoom;
@@ -414,6 +633,7 @@ export default function FreezonePanel() {
         setStatus(replacementId
           ? `${pattern.name} acquired; the selected piece was replaced.`
           : `${pattern.name} acquired. It has joined your army.`);
+        emitTeamVoiceEvent('purchase');
       } else {
         setStatus(result.error || 'Could not acquire this piece.');
       }
@@ -424,48 +644,92 @@ export default function FreezonePanel() {
     }
   };
 
+  const emitTeamVoiceEvent = (eventKey: 'purchase' | 'upgrade') => {
+    const speaker = hud?.ownedPieces.find((piece) => piece.voiceLines?.[eventKey]);
+    const text = speaker?.voiceLines?.[eventKey];
+    if (!speaker || !text) return;
+    window.dispatchEvent(new CustomEvent('wizard-chess-freezone-voice', {
+      detail: {
+        roomCode: hud?.roomCode || roomCode,
+        pieceId: speaker.id,
+        event: eventKey,
+        text,
+        voiceId: speaker.aiVoice,
+        voiceLines: speaker.voiceLines
+      }
+    }));
+  };
+
   const configuredPattern = (pattern: FreezonePatternInput): FreezonePatternInput => ({
     ...pattern,
     appearance,
     name: pieceName.trim() || pattern.name,
     title: pieceTitle.trim() || pattern.title,
     description: pieceDescription.trim() || pattern.description,
+    personality: piecePersonality.trim() || pattern.personality,
+    language: pieceLanguage || pattern.language,
+    aiVoice: pieceAIVoice || pattern.aiVoice,
     catchphrase: pieceCatchphrase.trim() || pattern.catchphrase,
     voiceLines
   });
 
-  const loadMusicUrl = () => {
-    let parsed: URL;
+  const loadMusicUrl = async () => {
+    const validation = validateFreezoneAudioUrl(musicUrl);
+    if (!validation.ok) {
+      setStatus(validation.error || 'Enter a valid direct audio URL.');
+      return;
+    }
+    const action = window.wizardChess?.setFreezoneSharedMusicUrl;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    const sharedUrl = validation.url || '';
     try {
-      parsed = new URL(musicUrl.trim());
-    } catch {
-      setStatus('Enter a valid direct audio URL beginning with http:// or https://.');
-      return;
+      const result = await action(sharedUrl);
+      if (!result.ok) {
+        setStatus(result.error || 'Could not share this music URL with the room.');
+        return;
+      }
+      if (localMusicUrl.current) {
+        URL.revokeObjectURL(localMusicUrl.current);
+        localMusicUrl.current = '';
+      }
+      setMusicUrl(sharedUrl);
+      setMusicSource(sharedUrl);
+      setStatus('Audio URL shared with the Freezone room. Each player must press Play.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not share this music URL with the room.');
     }
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      setStatus('Audio URLs must use http:// or https://.');
-      return;
+  };
+
+  const clearSharedMusic = async () => {
+    const action = window.wizardChess?.setFreezoneSharedMusicUrl;
+    if (!action) return setStatus('Freezone is still starting. Try again in a moment.');
+    try {
+      const result = await action('');
+      if (!result.ok) {
+        setStatus(result.error || 'Could not clear the shared music URL.');
+        return;
+      }
+      setStatus('Shared audio URL cleared.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not clear the shared music URL.');
     }
-    if (localMusicUrl.current) {
-      URL.revokeObjectURL(localMusicUrl.current);
-      localMusicUrl.current = '';
-    }
-    setMusicUrl(parsed.href);
-    setMusicSource(parsed.href);
-    setStatus('Audio link loaded on this device only.');
   };
 
   const loadMusicFile = (file?: File) => {
     if (!file) return;
-    if (file.type !== 'audio/mpeg' && !file.name.toLowerCase().endsWith('.mp3')) {
-      setStatus('Choose an MP3 audio file.');
+    const validation = validateFreezoneAudioFile(file);
+    if (!validation.ok) {
+      setStatus(validation.error || 'Choose a valid MP3 audio file no larger than 20 MB.');
       return;
     }
     if (localMusicUrl.current) URL.revokeObjectURL(localMusicUrl.current);
     localMusicUrl.current = URL.createObjectURL(file);
     setMusicUrl('');
     setMusicSource(localMusicUrl.current);
-    setStatus('Local MP3 loaded. It is available only in this browser session.');
+    setStatus('Local MP3 loaded. It is available only on this device and is not shared.');
   };
 
   const toggleMusic = async () => {
@@ -500,6 +764,7 @@ export default function FreezonePanel() {
       setStatus(result.ok
         ? `${FREEZONE_UPGRADES.find((upgrade) => upgrade.type === type)?.label} upgraded.`
         : result.error || 'Could not purchase this upgrade.');
+      if (result.ok) emitTeamVoiceEvent('upgrade');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not purchase this upgrade.');
     } finally {
@@ -510,23 +775,27 @@ export default function FreezonePanel() {
   const toggleMove = (row: number, col: number) => {
     const exists = selectedMoves.some(([r, c]) => r === row && c === col);
     const isJump = selectedJumps.some(([r, c]) => r === row && c === col);
+    const isTeleport = selectedTeleports.some(([r, c]) => r === row && c === col);
     if (!exists) {
       if (selectedMoves.length >= (hud?.maxPatternOffsets || 48)) {
         setStatus(`A pattern can have at most ${hud?.maxPatternOffsets || 48} offsets.`);
         return;
       }
       setSelectedMoves((current) => [...current, [row, col]]);
+      if (row === 0 && col === 0) setSelectedTeleports((current) => [...current, [row, col]]);
       return;
     }
-    if (!isJump) {
+    if (!isJump && !isTeleport) {
       setSelectedJumps((current) => [...current, [row, col]]);
       return;
     }
-    setSelectedMoves((current) => {
-      const exists = current.some(([r, c]) => r === row && c === col);
-      return exists ? current.filter(([r, c]) => r !== row || c !== col) : current;
-    });
-    setSelectedJumps((current) => current.filter(([r, c]) => r !== row || c !== col));
+    if (isJump) {
+      setSelectedJumps((current) => current.filter(([r, c]) => r !== row || c !== col));
+      setSelectedTeleports((current) => [...current, [row, col]]);
+      return;
+    }
+    setSelectedMoves((current) => current.filter(([r, c]) => r !== row || c !== col));
+    setSelectedTeleports((current) => current.filter(([r, c]) => r !== row || c !== col));
   };
 
   const copyRoomCode = async () => {
@@ -541,28 +810,54 @@ export default function FreezonePanel() {
 
   const canAcquire = Boolean(hud?.isPlayer && hud.xp >= hud.xpCost);
   const previewName = pieceName.trim() || `Custom ${pieceType}`;
-  const editorRange = hud?.editorRange || 3;
-  const editorDiameter = editorRange * 2 + 1;
+  const editorRows = (hud?.envelopeRows || 2) * 2 + 1;
+  const editorCols = (hud?.envelopeCols || 2) * 2 + 1;
+  const upgradeableEnvelopes = hud
+    ? FREEZONE_ENVELOPE_OPTIONS.filter((option) =>
+      canUpgradeFreezoneEnvelope(
+        hud.envelopeRows, hud.envelopeCols, option.rows, option.cols
+      )
+    )
+    : [];
+  const purchaseEnvelopeUpgrade = async () => {
+    const action = window.wizardChess?.upgradeFreezoneEnvelope;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(targetEnvelope.rows, targetEnvelope.cols);
+      setStatus(result.ok
+        ? `Movement envelope upgraded to ${targetEnvelope.rows}×${targetEnvelope.cols}.`
+        : result.error || 'Could not upgrade the movement envelope.');
+      if (result.ok) emitTeamVoiceEvent('upgrade');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not upgrade the movement envelope.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  };
 
   return (
     <>
-      <div className="freezone-hud" aria-live="polite">
-        {hud && (
+      {!mainMenuOpen && hud?.enabled ? (
+        <div className="freezone-hud" aria-live="polite">
           <span className="freezone-hud-stats">
             XP {hud.xp} · Army {hud.pieces}/{hud.capacity}
           </span>
-        )}
-        <button
-          type="button"
-          className="hud-btn freezone-open"
-          onClick={() => {
-            setStatus('');
-            setOpen(true);
-          }}
-        >
-          {hud ? 'Piece Shop' : 'Freezone Arena'}
-        </button>
-      </div>
+          <button
+            type="button"
+            className="hud-btn freezone-open"
+            onClick={() => {
+              setStatus('');
+              setOpen(true);
+            }}
+          >
+            Piece Shop
+          </button>
+        </div>
+      ) : null}
 
       <div
         className={`freezone-overlay ${open ? 'open' : ''}`}
@@ -606,7 +901,13 @@ export default function FreezonePanel() {
                   {hud.cooldownMs > 0 ? ' resting' : ' actions left'}
                 </span>
                 <span><strong>{(hud.cooldownDurationMs / 1000).toFixed(1)}s</strong> cooldown</span>
-                <span><strong>±{hud.editorRange}</strong> editor reach</span>
+                <span><strong>{hud.envelopeRows}×{hud.envelopeCols}</strong> movement envelope</span>
+                <span><strong>{Math.max(0, hud.stepBudget - hud.stepsUsed)}/{hud.stepBudget}</strong> unit steps left</span>
+                {hud.mutantZone && (
+                  <span className="freezone-mutant-summary">
+                    <strong>{hud.mutantZone.shape}</strong> mutates · {Math.ceil(hud.mutantZone.remainingMs / 1000)}s left
+                  </span>
+                )}
                 {roomCode && (
                   <button type="button" onClick={() => void copyRoomCode()}>
                     Arena {roomCode} · Copy
@@ -627,7 +928,11 @@ export default function FreezonePanel() {
                 {hud.xpProgress}/{hud.xpCost} XP toward the next piece · {hud.movesPerCycle} actions per cycle
               </p>
               <p className="freezone-hint">
-                Upgrade levels: Red {hud.upgradeLevels.red} · Yellow {hud.upgradeLevels.yellow} ·
+                Envelope {hud.envelopeRows}×{hud.envelopeCols} is independent from the {hud.stepBudget}-step cycle budget.
+              </p>
+              <p className="freezone-hint">
+                Upgrade levels: Red {hud.upgradeLevels.red} · Blue {hud.upgradeLevels.blue} ·
+                Yellow {hud.upgradeLevels.yellow} ·
                 Purple {hud.upgradeLevels.purple} · White {hud.upgradeLevels.white}
               </p>
               {hud.eliminationLeaders.count > 0 && (
@@ -673,6 +978,35 @@ export default function FreezonePanel() {
                     </button>
                   </div>
                 ))}
+                <div className="freezone-upgrade">
+                  <span>
+                    <strong>Movement envelope</strong>
+                    <small>Choose the next grid size · costs 1 white orb · {hud.orbBalances.white} available</small>
+                  </span>
+                  <select
+                    value={`${targetEnvelope.rows}x${targetEnvelope.cols}`}
+                    onChange={(event) => {
+                      const [rows, cols] = event.target.value.split('x').map(Number);
+                      setTargetEnvelope({ rows, cols });
+                    }}
+                    disabled={!upgradeableEnvelopes.length}
+                    aria-label="Choose movement envelope upgrade"
+                  >
+                    {upgradeableEnvelopes.map((option) => (
+                      <option key={`${option.rows}x${option.cols}`} value={`${option.rows}x${option.cols}`}>
+                        {option.rows}×{option.cols}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={!hud.isPlayer || purchaseBusy || !upgradeableEnvelopes.length ||
+                      hud.orbBalances.white < 1}
+                    onClick={() => void purchaseEnvelopeUpgrade()}
+                  >
+                    {upgradeableEnvelopes.length ? 'Spend 1 white orb' : 'Max envelope'}
+                  </button>
+                </div>
               </div>
               <section className="freezone-customization" aria-label="Piece profile and local audio settings">
                 <h3>Piece appearance & profile</h3>
@@ -704,6 +1038,26 @@ export default function FreezonePanel() {
                   <label className="freezone-field-wide">
                     Public description
                     <textarea value={pieceDescription} maxLength={160} placeholder="A short public profile" onChange={(event) => setPieceDescription(event.target.value)} />
+                  </label>
+                  <label className="freezone-field-wide">
+                    Personality for AI lines and decisions
+                    <textarea value={piecePersonality} maxLength={240} placeholder="Calm strategist who protects allies and taunts rivals" onChange={(event) => setPiecePersonality(event.target.value)} />
+                  </label>
+                  <label>
+                    AI dialogue language
+                    <select value={pieceLanguage} onChange={(event) => setPieceLanguage(event.target.value)}>
+                      {FREEZONE_AI_LANGUAGES.map(({ id, label }) => (
+                        <option value={id} key={id}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    AI character voice for this piece
+                    <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
+                      {FREEZONE_AI_VOICES.map(({ id, label }) => (
+                        <option value={id} key={id}>{label}</option>
+                      ))}
+                    </select>
                   </label>
                   <label className="freezone-field-wide">
                     Public phrase
@@ -757,16 +1111,119 @@ export default function FreezonePanel() {
                   </div>
                 </details>
                 <details className="freezone-audio-settings">
-                  <summary>Local Freezone music (not shared with other players)</summary>
+                  <summary>AI providers, API keys & generated voices</summary>
+                  <label className="freezone-local-toggle">
+                    <input type="checkbox" checked={aiVoiceEnabled} onChange={(event) => setAIVoiceEnabled(event.target.checked)} />
+                    Enable AI-generated character speech on this device
+                  </label>
+                  <p className="freezone-hint">
+                    AI decisions use the selected text provider once per bot action. The default voice is Gemini Live (gemini-3.8-live); Gemini TTS, OpenAI TTS and Google Cloud TTS are also available. Audio is generated per listener and provider billing/rate limits apply.
+                  </p>
+                  <div className="freezone-designer-fields">
+                    <label>
+                      Strategy and dialogue provider
+                      <select
+                        value={aiSettings.textProvider}
+                        onChange={(event) => updateAISettings({
+                          textProvider: event.target.value as 'gemini' | 'openai' | 'deepseek'
+                        })}
+                      >
+                        <option value="gemini">Gemini</option>
+                        <option value="openai">ChatGPT / OpenAI</option>
+                        <option value="deepseek">DeepSeek</option>
+                      </select>
+                    </label>
+                    <label>
+                      Generated voice provider
+                      <select
+                        value={aiSettings.voiceProvider}
+                        onChange={(event) => updateAISettings({
+                          voiceProvider: event.target.value as 'gemini-live' | 'gemini-tts' | 'openai-tts' | 'google-tts'
+                        })}
+                      >
+                        <option value="gemini-live">Gemini Live — default</option>
+                        <option value="gemini-tts">Gemini TTS</option>
+                        <option value="openai-tts">OpenAI TTS</option>
+                        <option value="google-tts">Google Cloud TTS</option>
+                      </select>
+                    </label>
+                    <label>
+                      Gemini API key (strategy / Gemini voice)
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={512}
+                        value={aiSettings.apiKeys.gemini}
+                        onChange={(event) => updateAIKey('gemini', event.target.value)}
+                        placeholder="Paste Gemini API key"
+                      />
+                    </label>
+                    <label>
+                      OpenAI API key (ChatGPT / OpenAI TTS)
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={512}
+                        value={aiSettings.apiKeys.openai}
+                        onChange={(event) => updateAIKey('openai', event.target.value)}
+                        placeholder="Paste OpenAI API key"
+                      />
+                    </label>
+                    <label>
+                      DeepSeek API key
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={512}
+                        value={aiSettings.apiKeys.deepseek}
+                        onChange={(event) => updateAIKey('deepseek', event.target.value)}
+                        placeholder="Paste DeepSeek API key"
+                      />
+                    </label>
+                    <label>
+                      Google Cloud TTS API key
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        maxLength={512}
+                        value={aiSettings.apiKeys.google}
+                        onChange={(event) => updateAIKey('google', event.target.value)}
+                        placeholder="Paste Google Cloud key"
+                      />
+                    </label>
+                  </div>
+                  <p className="freezone-hint">
+                    Keys stay in this browser session only: they are never saved to local storage or synchronized to the room. They are sent over HTTPS to the project’s Supabase Edge Function and used for your provider request. Clear them here or reload the page to remove them.
+                  </p>
+                  <button type="button" onClick={clearAIKeys}>Clear API keys</button>
+                  <button
+                    type="button"
+                    disabled={!aiVoiceEnabled || !aiVoiceReady}
+                    onClick={() => void aiVoiceAudioRef.current?.play().catch(() => {
+                      setAIVoiceStatus('The generated voice could not be played by this browser.');
+                    })}
+                  >
+                    Play latest voice
+                  </button>
+                  <audio ref={aiVoiceAudioRef} onError={() => {
+                    if (aiVoiceReady) setAIVoiceStatus('The generated voice audio could not be played.');
+                  }} />
+                  {aiVoiceStatus && <p className="freezone-hint" aria-live="polite">{aiVoiceStatus}</p>}
+                </details>
+                <details className="freezone-audio-settings">
+                  <summary>Freezone music</summary>
                   <label>
-                    Choose MP3 file
+                    Local MP3 (this device only)
                     <input type="file" accept=".mp3,audio/mpeg" onChange={(event) => loadMusicFile(event.target.files?.[0])} />
                   </label>
                   <label>
-                    Direct audio link
+                    Share direct audio URL with room
                     <span className="freezone-audio-url">
                       <input value={musicUrl} maxLength={2048} placeholder="https://example.com/music.mp3" onChange={(event) => setMusicUrl(event.target.value)} />
-                      <button type="button" onClick={loadMusicUrl}>Load</button>
+                      <button type="button" onClick={() => void loadMusicUrl()}>Share</button>
+                      {hud.sharedMusicUrl && (
+                        <button type="button" onClick={() => void clearSharedMusic()}>Clear</button>
+                      )}
                     </span>
                   </label>
                   <div className="freezone-music-controls">
@@ -787,7 +1244,11 @@ export default function FreezonePanel() {
                       setStatus('This file/link is not playable audio. Choose an MP3 or a direct browser-playable audio URL.');
                     }}
                   />
-                  <p className="freezone-hint">A local file cannot be shared across devices. The remote URL is saved only in this browser.</p>
+                  <p className="freezone-hint">
+                    {hud.sharedMusicUrl
+                      ? 'Shared URL is synchronized; each participant must press Play.'
+                      : 'No shared URL is set. A local MP3 cannot be shared across devices.'}
+                  </p>
                 </details>
               </section>
               <div className="freezone-tabs" role="tablist" aria-label="Piece options">
@@ -839,8 +1300,10 @@ export default function FreezonePanel() {
                       <div>
                         <strong>{pattern.name}</strong>
                         {pattern.title && <span>{pattern.title}</span>}
+                        {pattern.personality && <span>Personality: {pattern.personality}</span>}
+                        <span>{FREEZONE_AI_LANGUAGES.find(({ id }) => id === pattern.language)?.label || pattern.language} · {FREEZONE_AI_VOICES.find(({ id }) => id === pattern.aiVoice)?.label || pattern.aiVoice}</span>
                         {pattern.catchphrase && <span>“{pattern.catchphrase}”</span>}
-                        <span>{movementText(pattern.moves, pattern.jumps, pattern.slide)}</span>
+                        <span>{movementText(pattern.moves, pattern.jumps, pattern.teleports, pattern.slide)}</span>
                       </div>
                       <button
                         type="button"
@@ -895,19 +1358,20 @@ export default function FreezonePanel() {
                     </label>
                   </div>
                   <p className="freezone-hint">
-                    Editor reach: up to ±{editorRange} tiles in each direction. This does not change the physical board size.
+                    Envelope {hud.envelopeRows}×{hud.envelopeCols}; actions spend up to {hud.stepBudget} unit steps per cycle.
+                    This changes movement design only, not the physical board.
                   </p>
                   <div
                     className="freezone-preview-board"
                     role="group"
                     aria-label="Movement pattern preview"
-                    style={{ gridTemplateColumns: `repeat(${editorDiameter}, minmax(0, 1fr))` }}
+                    style={{ gridTemplateColumns: `repeat(${editorCols}, minmax(0, 1fr))` }}
                   >
-                    {Array.from({ length: editorDiameter * editorDiameter }, (_, index) => {
-                      const row = Math.floor(index / editorDiameter);
-                      const col = index % editorDiameter;
-                      const offsetRow = editorRange - row;
-                      const offsetCol = col - editorRange;
+                    {Array.from({ length: editorRows * editorCols }, (_, index) => {
+                      const row = Math.floor(index / editorCols);
+                      const col = index % editorCols;
+                      const offsetRow = hud.envelopeRows - row;
+                      const offsetCol = col - hud.envelopeCols;
                       const center = offsetRow === 0 && offsetCol === 0;
                       const selected = selectedMoves.some(
                         ([moveRow, moveCol]) => moveRow === offsetRow && moveCol === offsetCol
@@ -918,32 +1382,36 @@ export default function FreezonePanel() {
                       const jump = selectedJumps.some(
                         ([moveRow, moveCol]) => moveRow === offsetRow && moveCol === offsetCol
                       );
+                      const teleport = selectedTeleports.some(
+                        ([moveRow, moveCol]) => moveRow === offsetRow && moveCol === offsetCol
+                      );
                       return (
                         <button
                           key={`${offsetRow},${offsetCol}`}
                           type="button"
-                          className={`${center ? 'center' : ''} ${selected ? 'selected' : ''} ${jump ? 'jump' : ''}`}
-                          disabled={center}
-                          aria-label={center ? 'Piece starting square' : `Move ${offsetRow}, ${offsetCol}`}
+                          className={`${center ? 'center' : ''} ${selected ? 'selected' : ''} ${jump ? 'jump' : ''} ${teleport ? 'teleport' : ''}`}
+                          aria-label={center ? 'Teleport to the same square' : `Move ${offsetRow}, ${offsetCol}`}
                           aria-pressed={selected}
                           onClick={() => toggleMove(offsetRow, offsetCol)}
                         >
-                          {center ? '●' : selected ? String(step + 1) : ''}
+                          {center ? (teleport ? 'T' : '●') : selected ? String(step + 1) : ''}
                         </button>
                       );
                     })}
                   </div>
                   <p className="freezone-move-legend">
-                    <span><i className="ordinary" /> Ordinary move</span>
-                    <span><i className="jump" /> Jump (click a selected square twice)</span>
+                    <span><i className="ordinary" /> Drag / slide (blue)</span>
+                    <span><i className="jump" /> Path-checked jump (green)</span>
+                    <span><i className="teleport" /> Teleport (red, no path)</span>
                   </p>
+                  <p className="freezone-hint">Click a selected square to cycle drag → jump → teleport → remove.</p>
                   <label className="freezone-slide">
                     <input type="checkbox" checked={slide} onChange={(event) => setSlide(event.target.checked)} />
                     Slide along each selected direction
                   </label>
                   <p className="freezone-hint">
                     {selectedMoves.length
-                      ? movementText(selectedMoves, selectedJumps, slide)
+                      ? movementText(selectedMoves, selectedJumps, selectedTeleports, slide)
                       : 'Choose at least one reachable square.'}
                   </p>
                   <button
@@ -956,10 +1424,14 @@ export default function FreezonePanel() {
                       catchphrase: pieceCatchphrase.trim(),
                       appearance,
                       description: pieceDescription.trim(),
+                      personality: piecePersonality.trim(),
+                      language: pieceLanguage,
+                      aiVoice: pieceAIVoice,
                       voiceLines,
                       type: pieceType,
                       moves: selectedMoves,
                       jumps: selectedJumps,
+                      teleports: selectedTeleports,
                       slide
                     }))}
                   >
@@ -1039,10 +1511,21 @@ export default function FreezonePanel() {
           <strong>{inspectedPiece.name}</strong>
           <span>{inspectedPiece.title || 'Piece'} · {inspectedPiece.type} · {FREEZONE_APPEARANCES.find(({ id }) => id === inspectedPiece.appearance)?.label || 'Classic'}</span>
           {inspectedPiece.description && <p>{inspectedPiece.description}</p>}
+          {inspectedPiece.personality && <p>Personality: {inspectedPiece.personality}</p>}
+          <span>{FREEZONE_AI_LANGUAGES.find(({ id }) => id === inspectedPiece.language)?.label || inspectedPiece.language} · {FREEZONE_AI_VOICES.find(({ id }) => id === inspectedPiece.aiVoice)?.label || inspectedPiece.aiVoice}</span>
           {inspectedPiece.catchphrase && <q>{inspectedPiece.catchphrase}</q>}
           <span>Eliminations: {inspectedPiece.eliminations}</span>
           <span>{inspectedPiece.slide ? 'Sliding pattern' : 'Step pattern'}</span>
           <FreezoneMovementDiagram piece={inspectedPiece} />
+        </div>
+      )}
+      {speechBubble && (
+        <div
+          className="freezone-speech-bubble"
+          aria-hidden="true"
+          style={{ left: speechBubble.x, top: speechBubble.y }}
+        >
+          {speechBubble.text}
         </div>
       )}
     </>
@@ -1050,10 +1533,11 @@ export default function FreezonePanel() {
 }
 
 function FreezoneMovementDiagram({ piece }: { piece: FreezoneInspectedPiece }) {
-  const offsets = [...piece.moves, ...piece.jumps];
+  const offsets = [...piece.moves, ...piece.jumps, ...piece.teleports];
   const range = Math.max(1, ...offsets.map(([row, col]) => Math.max(Math.abs(row), Math.abs(col))));
   const width = range * 2 + 1;
   const jumpKeys = new Set(piece.jumps.map(([row, col]) => `${row},${col}`));
+  const teleportKeys = new Set(piece.teleports.map(([row, col]) => `${row},${col}`));
   const moveKeys = new Set(piece.moves.map(([row, col]) => `${row},${col}`));
   return (
     <div
@@ -1067,10 +1551,11 @@ function FreezoneMovementDiagram({ piece }: { piece: FreezoneInspectedPiece }) {
         const col = index % width - range;
         const key = `${row},${col}`;
         const center = row === 0 && col === 0;
+        const isTeleport = teleportKeys.has(key);
         return (
           <i
             key={key}
-            className={`${center ? 'center' : ''} ${moveKeys.has(key) ? 'ordinary' : ''} ${jumpKeys.has(key) ? 'jump' : ''}`}
+            className={`${center ? 'center' : ''} ${moveKeys.has(key) ? 'ordinary' : ''} ${jumpKeys.has(key) ? 'jump' : ''} ${isTeleport ? 'teleport' : ''}`}
           />
         );
       })}

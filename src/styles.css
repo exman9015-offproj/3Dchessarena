@@ -10,11 +10,102 @@
   --danger: #e63946;
 }
 
+.game-mode-menu,
+.camera-preset-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid rgba(212, 175, 55, 0.22);
+  border-radius: 14px;
+  background: rgba(8, 10, 15, 0.7);
+  backdrop-filter: blur(10px);
+}
+
+.game-mode-menu .freezone-hud {
+  gap: 6px;
+}
+
+.camera-preset-group .hud-btn {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 0.68rem;
+}
+
+.camera-preset-group {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.camera-preset-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.camera-preset-label svg,
+.hud-icon-button svg,
+#btn-hide-ui svg,
+.mobile-controls-trigger svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.hud-icon-button {
+  width: 42px;
+  min-width: 42px;
+  min-height: 38px;
+  padding: 8px;
+}
+
+.ui-restore-btn {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 22;
+  display: none;
+  pointer-events: auto;
+}
+
+body.cinematic-ui-hidden .ui-restore-btn {
+  display: inline-flex;
+}
+
+.camera-preset-select {
+  min-width: 120px;
+  color-scheme: dark;
+  cursor: pointer;
+}
+
+.camera-preset-select option {
+  background: #0c0f16;
+  color: var(--text);
+}
+
+.return-menu-btn {
+  margin-left: auto;
+  pointer-events: auto;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
   user-select: none;
+}
+
+.freezone-preview-board button.selected.teleport {
+  background: rgba(230, 57, 70, 0.43);
+  box-shadow: inset 0 0 0 2px #e63946;
+  color: #ffd1d4;
 }
 
 html, body, #root {
@@ -24,6 +115,28 @@ html, body, #root {
   background: var(--bg);
   color: var(--text);
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, serif;
+}
+
+.freezone-speech-bubble {
+  position: fixed;
+  z-index: 12;
+  max-width: min(250px, 70vw);
+  padding: 7px 11px;
+  transform: translate(-50%, -100%);
+  border: 1px solid rgba(245, 215, 110, 0.8);
+  border-radius: 12px 12px 12px 3px;
+  background: rgba(12, 15, 22, 0.94);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 14px rgba(212, 175, 55, 0.2);
+  color: #fff4cd;
+  font-size: 0.76rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  text-align: center;
+}
+
+.freezone-piece-moves i.teleport {
+  background: #e63946;
 }
 
 #canvas-container {
@@ -408,7 +521,7 @@ body.cinematic-ui-hidden #hud-bottom {
 .mobile-sheet-header,
 .mobile-sheet-section-label,
 .mobile-sheet-hint,
-.mobile-only-restore-ui {
+.ui-restore-btn {
   display: none;
 }
 
@@ -430,6 +543,19 @@ body.cinematic-ui-hidden #hud-bottom {
     min-width: 0;
     flex-wrap: nowrap;
     gap: 6px;
+  }
+
+  .game-mode-menu,
+  .camera-preset-group {
+    gap: 4px;
+    padding: 3px;
+  }
+
+  .game-mode-menu .hud-btn,
+  .game-mode-menu .freezone-open {
+    min-height: 32px;
+    padding: 6px 8px;
+    font-size: 0.63rem;
   }
 
   .brand-pill {
@@ -475,22 +601,6 @@ body.cinematic-ui-hidden #hud-bottom {
     border-color: var(--hud-border);
     color: var(--gold-bright);
     white-space: nowrap;
-  }
-
-  /* Restore UI button when Hide UI is active on mobile */
-  body.cinematic-ui-hidden .mobile-only-restore-ui {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    position: fixed;
-    top: 12px;
-    right: 12px;
-    z-index: 22;
-    min-height: 38px;
-    padding: 7px 14px;
-    border-color: var(--hud-border);
-    color: var(--gold-bright);
-    pointer-events: auto;
   }
 
   /* Bottom Sheet Backdrop */
@@ -648,12 +758,14 @@ body.cinematic-ui-hidden #hud-bottom {
     grid-column: span 2;
   }
 
-  /* 4 Camera View buttons in a 2x2 grid */
-  #btn-cam-player,
-  #btn-cam-top,
-  #btn-cam-side,
-  #btn-cam-wide {
-    grid-column: span 3;
+  #hud-right .camera-preset-group {
+    grid-column: span 6;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  #hud-right .camera-preset-select {
+    width: 100%;
+    min-width: 0;
   }
 
   /* Full-width Hide UI button */
@@ -726,6 +838,41 @@ body.cinematic-ui-hidden #hud-bottom {
   }
 }
 
+.freezone-dialog .freezone-summary span,
+.freezone-dialog .freezone-summary button,
+.freezone-dialog .freezone-upgrade,
+.freezone-dialog .freezone-customization {
+  border-color: rgba(212, 175, 55, 0.26);
+}
+
+.freezone-dialog button:not(.freezone-close) {
+  border-color: rgba(212, 175, 55, 0.46);
+}
+
+.freezone-dialog .freezone-summary button,
+.freezone-dialog .freezone-upgrade button,
+.freezone-dialog .freezone-create,
+.freezone-dialog .freezone-join button {
+  background: rgba(212, 175, 55, 0.12);
+  color: #f5d76e;
+}
+
+.freezone-dialog .freezone-upgrade select {
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid rgba(212, 175, 55, 0.34);
+  border-radius: 8px;
+  background: rgba(4, 6, 11, 0.82);
+  color: var(--text);
+}
+
+.freezone-dialog input:focus,
+.freezone-dialog select:focus,
+.freezone-dialog textarea:focus {
+  outline: 2px solid rgba(245, 215, 110, 0.55);
+  outline-offset: 1px;
+}
+
 @media (max-width: 380px) {
   .brand-pill {
     padding: 6px 9px;
@@ -773,6 +920,98 @@ body.cinematic-ui-hidden #hud-bottom {
   padding: 18px;
   background: rgba(3, 5, 9, 0.78);
   backdrop-filter: blur(8px);
+}
+
+.main-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 35;
+  display: none;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 5, 9, 0.78);
+  backdrop-filter: blur(8px);
+}
+
+.main-menu-overlay.open {
+  display: grid;
+}
+
+.main-menu-dialog {
+  width: min(460px, 100%);
+  padding: clamp(24px, 5vw, 40px);
+  border: 1px solid rgba(212, 175, 55, 0.7);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 50% 0, rgba(212, 175, 55, 0.12), transparent 42%),
+    linear-gradient(150deg, rgba(20, 23, 31, 0.98), rgba(7, 9, 14, 0.99));
+  box-shadow: 0 24px 90px rgba(0, 0, 0, 0.7), inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  text-align: center;
+}
+
+.main-menu-eyebrow {
+  color: var(--gold-bright);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+}
+
+.main-menu-dialog h1 {
+  margin-top: 10px;
+  color: #f1d778;
+  font-size: clamp(1.7rem, 5vw, 2.25rem);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.main-menu-description {
+  margin: 8px 0 24px;
+  color: var(--muted);
+}
+
+.main-menu-actions {
+  display: grid;
+  gap: 10px;
+}
+
+.main-menu-choice {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 11px 16px;
+  border: 1px solid rgba(212, 175, 55, 0.38);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(30, 33, 40, 0.96), rgba(13, 16, 23, 0.96));
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  transition: border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, background 0.18s ease;
+}
+
+.main-menu-choice.primary {
+  border-color: var(--gold);
+  background: linear-gradient(135deg, rgba(212, 175, 55, 0.3), rgba(102, 77, 20, 0.3));
+  color: var(--gold-bright);
+}
+
+.main-menu-choice:hover {
+  transform: translateY(-1px);
+  border-color: var(--gold-bright);
+  color: var(--gold-bright);
+}
+
+.main-menu-status {
+  margin-top: 16px;
+  color: var(--gold-bright);
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 .multiplayer-overlay.open {
@@ -1303,6 +1542,44 @@ body.cinematic-ui-hidden #hud-bottom {
 }
 
 @media (max-width: 768px) {
+  .main-menu-overlay {
+    padding: 14px;
+  }
+
+  .main-menu-dialog {
+    max-height: calc(100dvh - 28px);
+    overflow-y: auto;
+    padding: 24px 18px;
+  }
+
+  .main-menu-description {
+    margin-bottom: 18px;
+  }
+
+  .main-menu-choice {
+    min-height: 44px;
+    font-size: 0.78rem;
+  }
+
+  #btn-main-menu {
+    position: fixed;
+    top: 12px;
+    right: 60px;
+    z-index: 22;
+    min-height: 38px;
+    pointer-events: auto;
+  }
+
+  .freezone-hud {
+    top: 58px;
+    right: 12px;
+  }
+
+  #hud-right #btn-hide-ui {
+    grid-column: span 1;
+    width: 44px;
+  }
+
   .mode-creator-overlay {
     z-index: 60;
     padding: 8px;
@@ -1331,9 +1608,14 @@ body.cinematic-ui-hidden #hud-bottom {
 }
 
 .freezone-hud {
+  position: fixed;
+  top: 16px;
+  right: 168px;
+  z-index: 11;
   display: flex;
   align-items: center;
   gap: 8px;
+  pointer-events: auto;
 }
 
 .freezone-hud-stats {
@@ -1341,7 +1623,7 @@ body.cinematic-ui-hidden #hud-bottom {
   border: 1px solid rgba(78, 168, 222, 0.35);
   border-radius: 999px;
   background: var(--hud-bg);
-  color: #b9e8ff;
+  color: var(--gold-bright);
   font-size: 0.72rem;
   font-weight: 700;
   white-space: nowrap;
@@ -1369,9 +1651,11 @@ body.cinematic-ui-hidden #hud-bottom {
   max-height: 94vh;
   overflow: auto;
   padding: 30px;
-  border: 1px solid rgba(78, 168, 222, 0.42);
+  border: 1px solid rgba(212, 175, 55, 0.52);
   border-radius: 20px;
-  background: linear-gradient(160deg, rgba(20, 24, 34, 0.99), rgba(8, 10, 16, 0.99));
+  background:
+    linear-gradient(rgba(18, 19, 24, 0.97), rgba(8, 10, 15, 0.98)),
+    repeating-conic-gradient(rgba(212, 175, 55, 0.07) 0% 25%, transparent 0% 50%) 0 0 / 28px 28px;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.76);
 }
 
@@ -1391,7 +1675,7 @@ body.cinematic-ui-hidden #hud-bottom {
 
 .freezone-eyebrow {
   margin-bottom: 8px;
-  color: #83d8ff;
+  color: var(--gold);
   font-size: 0.67rem;
   font-weight: 800;
   letter-spacing: 0.13em;
@@ -1761,6 +2045,10 @@ body.cinematic-ui-hidden #hud-bottom {
   background: #32c779;
 }
 
+.freezone-move-legend i.teleport {
+  background: #e63946;
+}
+
 .freezone-room-list {
   display: grid;
   gap: 8px;
@@ -1811,6 +2099,7 @@ body.cinematic-ui-hidden #hud-bottom {
   left: 50%;
   bottom: 76px;
   z-index: 80;
+  pointer-events: none;
   max-width: min(90vw, 460px);
   padding: 11px 16px;
   border: 1px solid rgba(78, 168, 222, 0.46);
@@ -2061,6 +2350,8 @@ body.cinematic-ui-hidden #hud-bottom {
 
 @media (max-width: 768px) {
   .freezone-hud {
+    top: 58px;
+    right: 12px;
     gap: 6px;
   }
 

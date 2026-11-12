@@ -13,7 +13,7 @@ type CreatorRoom = {
   joined: number;
   capacity: number;
 };
-type FreezoneUpgrade = 'red' | 'yellow' | 'purple' | 'white';
+type FreezoneUpgrade = 'red' | 'blue' | 'yellow' | 'purple' | 'white';
 type MultiplayerAction = () => Promise<MultiplayerResult> | undefined;
 type MultiplayerApi = {
   createMultiplayerRoom?: (color: 'w' | 'b') => Promise<MultiplayerResult>;
@@ -31,6 +31,9 @@ type MultiplayerApi = {
     replacementId?: string
   ) => Promise<{ ok: boolean; error?: string }>;
   upgradeFreezoneSkill?: (type: FreezoneUpgrade) => Promise<{ ok: boolean; error?: string }>;
+  upgradeFreezoneEnvelope?: (rows: number, cols: number) => Promise<{ ok: boolean; error?: string }>;
+  setFreezoneSharedMusicUrl?: (url: string) => Promise<{ ok: boolean; error?: string }>;
+  leaveCurrentGame?: () => void;
 };
 
 declare global {
@@ -41,6 +44,7 @@ declare global {
 
 export default function App() {
   const initializedRef = useRef(false);
+  const [mainMenuOpen, setMainMenuOpen] = useState(true);
   const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
   const [multiplayerOpen, setMultiplayerOpen] = useState(
     () => Boolean(new URLSearchParams(window.location.search).get('room'))
@@ -107,6 +111,7 @@ export default function App() {
       const room = (event as CustomEvent<RoomState>).detail;
       if (!room) return;
       setRoomCode(room.code);
+      setMainMenuOpen(false);
       setMultiplayerStatus(
         room.whiteJoined && room.blackJoined
           ? 'Both players are connected. Your game is synced.'
@@ -123,13 +128,22 @@ export default function App() {
       const message = (event as CustomEvent<string>).detail;
       if (message) setMultiplayerStatus(message);
     };
+    const handleFreezoneState = (event: Event) => {
+      const state = (event as CustomEvent<{ enabled?: boolean }>).detail;
+      if (state?.enabled) {
+        setMainMenuOpen(false);
+        setMultiplayerOpen(false);
+      }
+    };
     window.addEventListener('wizard-chess-room-state', handleRoomState);
     window.addEventListener('wizard-chess-open-multiplayer', handleInvite);
     window.addEventListener('wizard-chess-multiplayer-status', handleMultiplayerStatus);
+    window.addEventListener('wizard-chess-freezone-state', handleFreezoneState);
     return () => {
       window.removeEventListener('wizard-chess-room-state', handleRoomState);
       window.removeEventListener('wizard-chess-open-multiplayer', handleInvite);
       window.removeEventListener('wizard-chess-multiplayer-status', handleMultiplayerStatus);
+      window.removeEventListener('wizard-chess-freezone-state', handleFreezoneState);
     };
   }, []);
 
@@ -153,6 +167,7 @@ export default function App() {
         setMultiplayerStatus(result.error || 'Could not connect to the room.');
         return;
       }
+      setMainMenuOpen(false);
       if (result.code) setRoomCode(result.code);
       setMultiplayerStatus(
         result.code
@@ -176,6 +191,21 @@ export default function App() {
     }
   };
 
+  const returnToMainMenu = () => {
+    setMobileSheetOpen(false);
+    setMultiplayerOpen(false);
+    setModeCreatorOpen(false);
+    setMainMenuOpen(true);
+    setRoomCode('');
+    setMultiplayerStatus('');
+    const leaveCurrentGame = window.wizardChess?.leaveCurrentGame;
+    if (leaveCurrentGame) {
+      leaveCurrentGame();
+    } else {
+      setMultiplayerStatus('Game services are still starting. You are back at the menu.');
+    }
+  };
+
   const handleRestoreUI = () => {
     const win = window as unknown as { wizardChess?: { toggleUI?: (force?: boolean) => void } };
     if (win.wizardChess?.toggleUI) {
@@ -183,7 +213,10 @@ export default function App() {
     } else {
       document.body.classList.remove('cinematic-ui-hidden');
       const btnHide = document.getElementById('btn-hide-ui');
-      if (btnHide) btnHide.textContent = 'Hide UI [H]';
+      if (btnHide) {
+        btnHide.setAttribute('aria-label', 'Hide HUD controls');
+        btnHide.title = 'Hide HUD controls (Shortcut: H)';
+      }
     }
   };
 
@@ -201,42 +234,42 @@ export default function App() {
 
       <button
         type="button"
-        className="hud-btn mobile-only-restore-ui"
+        className="hud-btn ui-restore-btn hud-icon-button"
         id="btn-mobile-show-ui"
         onClick={handleRestoreUI}
+        aria-label="Show HUD controls"
         title="Show HUD Controls"
       >
-        Show UI
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" />
+          <circle cx="12" cy="12" r="2.7" />
+        </svg>
       </button>
 
       <div id="hud-top">
         <div className="hud-group" id="hud-left">
-          <div className="brand-pill">
-            <span className="brand-title">Wizard Chess</span>
-          </div>
           <div className="status-pill" id="status-pill">
             <span className="turn-dot" id="turn-dot"></span>
             <span id="turn-text">White to Move</span>
             <span className="mode-badge" id="mode-badge">Playing as White</span>
           </div>
-          <button type="button" className="hud-btn free-mode-toggle">
-            Free Mode
-          </button>
-          <FreezonePanel />
-          <button type="button" className="hud-btn free-block-toggle" style={{ display: 'none' }}>
-            Remove Blocks
-          </button>
-          <button type="button" className="hud-btn" onClick={() => setModeCreatorOpen(true)}>
-            Mode Creator
-          </button>
+        </div>
+
+        {!mainMenuOpen && (
           <button
             type="button"
-            className="hud-btn multiplayer-trigger"
-            onClick={() => setMultiplayerOpen(true)}
+            className="hud-btn return-menu-btn hud-icon-button"
+            id="btn-main-menu"
+            onClick={returnToMainMenu}
+            title="Leave this game and return to the main menu"
+            aria-label="Back to Menu"
           >
-            Multiplayer
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m3 10 9-7 9 7" />
+              <path d="M5.5 9v11h13V9M9.5 20v-7h5v7" />
+            </svg>
           </button>
-        </div>
+        )}
 
         <button
           type="button"
@@ -245,8 +278,14 @@ export default function App() {
           aria-expanded={mobileSheetOpen}
           aria-controls="hud-right"
           onClick={() => setMobileSheetOpen((prev) => !prev)}
+          aria-label={mobileSheetOpen ? 'Close controls' : 'Open controls'}
+          title={mobileSheetOpen ? 'Close controls' : 'Open controls'}
         >
-          {mobileSheetOpen ? 'Close' : 'Controls'}
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            {mobileSheetOpen
+              ? <path d="m6 6 12 12M18 6 6 18" />
+              : <path d="M4 6h16M4 12h16M4 18h16" />}
+          </svg>
         </button>
 
         <div
@@ -289,29 +328,18 @@ export default function App() {
             </button>
           </div>
 
-          <div className="mobile-sheet-section-label">Game Actions</div>
-
           <button
             type="button"
-            className="hud-btn multiplayer-mobile-trigger"
-            onClick={() => {
-              setMultiplayerOpen(true);
-              setMobileSheetOpen(false);
-            }}
+            className="hud-btn free-block-toggle hud-icon-button"
+            id="btn-free-blocks"
+            style={{ display: 'none' }}
+            aria-label="Remove Blocks"
+            title="Remove Blocks"
           >
-            Multiplayer
-          </button>
-          <button type="button" className="hud-btn free-mode-toggle">
-            Free Mode
-          </button>
-          <button type="button" className="hud-btn free-block-toggle" style={{ display: 'none' }}>
-            Remove Blocks
-          </button>
-          <button type="button" className="hud-btn" onClick={() => {
-            setModeCreatorOpen(true);
-            setMobileSheetOpen(false);
-          }}>
-            Mode Creator
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z" />
+              <path d="m4.5 7.5 7.5 4 7.5-4M12 12v9M8.5 5l7.5 4.5" />
+            </svg>
           </button>
           <button
             className="hud-btn"
@@ -329,49 +357,29 @@ export default function App() {
           >
             AI Move
           </button>
-          <button
-            className="hud-btn"
-            id="btn-reset"
-            title="Start a fresh game on the altar"
-            onClick={() => setMobileSheetOpen(false)}
-          >
-            New Game
-          </button>
-
           <div className="hud-divider" aria-hidden="true"></div>
-          <div className="mobile-sheet-section-label">
-            <span>Camera Views</span>
-            <span className="mobile-sheet-section-sub">Tap active view to flip</span>
-          </div>
+          <div className="mobile-sheet-section-label">Camera Views</div>
 
-          <button
-            className="hud-btn active"
-            id="btn-cam-player"
-            title="Player Camera (Click again to flip White / Black view)"
-          >
-            Player Cam
-          </button>
-          <button
-            className="hud-btn"
-            id="btn-cam-top"
-            title="Overhead Board View (Click again to flip White / Black orientation)"
-          >
-            Overhead
-          </button>
-          <button
-            className="hud-btn"
-            id="btn-cam-side"
-            title="Side Profile View (Click again to switch East / West side)"
-          >
-            Side
-          </button>
-          <button
-            className="hud-btn"
-            id="btn-cam-wide"
-            title="Wide Cathedral View (Click again to switch North Rose / South Narthex)"
-          >
-            Cathedral
-          </button>
+          <div className="camera-preset-group" aria-label="Camera controls">
+            <label className="camera-preset-label" htmlFor="camera-preset-select" aria-label="Camera">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 7h3l1.5-2h9L18 7h3v12H3V7Z" />
+                <circle cx="12" cy="13" r="3.5" />
+              </svg>
+            </label>
+            <select
+              className="hud-btn camera-preset-select"
+              id="camera-preset-select"
+              aria-label="Choose camera view"
+              defaultValue="player"
+            >
+              <option value="custom" disabled>Custom view</option>
+              <option value="player">Player Cam</option>
+              <option value="top">Overhead</option>
+              <option value="side">Side</option>
+              <option value="wide">Cathedral</option>
+            </select>
+          </div>
 
           <div className="hud-divider" aria-hidden="true"></div>
           <div className="mobile-sheet-section-label">Display &amp; Gestures</div>
@@ -379,10 +387,14 @@ export default function App() {
           <button
             className="hud-btn"
             id="btn-hide-ui"
-            title="Toggle HUD visibility (Shortcut: H)"
+            title="Hide HUD controls (Shortcut: H)"
+            aria-label="Hide HUD controls"
             onClick={() => setMobileSheetOpen(false)}
           >
-            Hide UI [H]
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" />
+              <circle cx="12" cy="12" r="2.7" />
+            </svg>
           </button>
 
           <div className="mobile-sheet-hint">
@@ -397,6 +409,66 @@ export default function App() {
         </div>
         <div className="captured-pill" id="captured-tray"></div>
       </div>
+
+      <div className={`main-menu-overlay ${mainMenuOpen ? 'open' : ''}`} aria-hidden={!mainMenuOpen}>
+        <section className="main-menu-dialog" aria-labelledby="main-menu-title">
+          <p className="main-menu-eyebrow">SANCTUM · CHOOSE YOUR GAME</p>
+          <h1 id="main-menu-title">Wizard Chess</h1>
+          <p className="main-menu-description">Choose how you want to play.</p>
+          <div className="main-menu-actions">
+            <button
+              type="button"
+              className="main-menu-choice primary"
+              onClick={() => {
+                setMultiplayerStatus('');
+                setMultiplayerOpen(true);
+              }}
+            >
+              Multiplayer
+            </button>
+            <button
+              type="button"
+              className="main-menu-choice"
+              onClick={() => window.dispatchEvent(new Event('wizard-chess-open-freezone'))}
+            >
+              Freezone
+            </button>
+            <button
+              type="button"
+              className="main-menu-choice"
+              id="btn-reset"
+              onClick={() => {
+                setMultiplayerStatus('');
+                setMainMenuOpen(false);
+              }}
+            >
+              Test Mode
+            </button>
+            <button
+              type="button"
+              className="main-menu-choice free-mode-toggle"
+              onClick={() => {
+                setMultiplayerStatus('');
+                setMainMenuOpen(false);
+              }}
+            >
+              Free Mode
+            </button>
+            <button
+              type="button"
+              className="main-menu-choice"
+              onClick={() => setModeCreatorOpen(true)}
+            >
+              Mode Creator
+            </button>
+          </div>
+          {multiplayerStatus && (
+            <p className="main-menu-status" aria-live="polite">{multiplayerStatus}</p>
+          )}
+        </section>
+      </div>
+
+      <FreezonePanel mainMenuOpen={mainMenuOpen} />
 
       <div
         className={`multiplayer-overlay ${multiplayerOpen ? 'open' : ''}`}
@@ -550,6 +622,7 @@ export default function App() {
           if (!multiplayer) {
             window.wizardChess?.startCustomGame?.(config);
             setModeCreatorOpen(false);
+            setMainMenuOpen(false);
             return;
           }
           const action = window.wizardChess?.createCustomRoom;

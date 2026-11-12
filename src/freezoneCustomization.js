@@ -13,6 +13,12 @@ export const FREEZONE_APPEARANCES = [
 
 export const FREEZONE_VOICE_EVENTS = [
   { id: 'entry', label: 'Entering the arena' },
+  { id: 'move', label: 'After this piece moves' },
+  { id: 'capture', label: 'After this piece captures' },
+  { id: 'death', label: 'When this piece is captured' },
+  { id: 'allyDeath', label: 'When an ally is captured' },
+  { id: 'purchase', label: 'When the player acquires a piece' },
+  { id: 'upgrade', label: 'When the player buys an upgrade' },
   { id: 'inactivity', label: 'Long inactivity' },
   { id: 'inspection', label: 'Opponent inspects the piece' },
   { id: 'victory', label: 'Victory' },
@@ -20,7 +26,28 @@ export const FREEZONE_VOICE_EVENTS = [
   { id: 'vulnerable', label: 'Piece threatened' }
 ];
 
+export const FREEZONE_AI_LANGUAGES = [
+  { id: 'pt-BR', label: 'Português (Brasil)' },
+  { id: 'en-US', label: 'English' },
+  { id: 'es-ES', label: 'Español' }
+];
+
+export const FREEZONE_AI_VOICES = [
+  { id: 'alloy', label: 'Alloy' },
+  { id: 'ash', label: 'Ash' },
+  { id: 'ballad', label: 'Ballad' },
+  { id: 'coral', label: 'Coral' },
+  { id: 'echo', label: 'Echo' },
+  { id: 'fable', label: 'Fable' },
+  { id: 'onyx', label: 'Onyx' },
+  { id: 'nova', label: 'Nova' },
+  { id: 'sage', label: 'Sage' },
+  { id: 'shimmer', label: 'Shimmer' }
+];
+
 const appearanceIds = new Set(FREEZONE_APPEARANCES.map(({ id }) => id));
+const aiLanguageIds = new Set(FREEZONE_AI_LANGUAGES.map(({ id }) => id));
+const aiVoiceIds = new Set(FREEZONE_AI_VOICES.map(({ id }) => id));
 
 export function sanitizeFreezoneProfile(profile = {}) {
   const voiceLines = {};
@@ -36,11 +63,55 @@ export function sanitizeFreezoneProfile(profile = {}) {
     description: typeof profile.description === 'string'
       ? profile.description.trim().slice(0, 160)
       : '',
+    personality: typeof profile.personality === 'string'
+      ? profile.personality.trim().slice(0, 240)
+      : '',
+    language: aiLanguageIds.has(profile.language) ? profile.language : 'en-US',
+    aiVoice: aiVoiceIds.has(profile.aiVoice) ? profile.aiVoice : 'alloy',
     catchphrase: typeof profile.catchphrase === 'string'
       ? profile.catchphrase.trim().slice(0, 120)
       : '',
     voiceLines
   };
+}
+
+export function sanitizeFreezoneAIDialogue(dialogue) {
+  if (!dialogue || typeof dialogue.id !== 'string' || dialogue.id.length > 128 ||
+      !dialogue.id.length || !Number.isSafeInteger(dialogue.createdAt) ||
+      dialogue.createdAt < 0) return null;
+  const lines = (Array.isArray(dialogue.lines) ? dialogue.lines : [])
+    .slice(0, 2)
+    .filter((line) => line && typeof line.pieceId === 'string' &&
+      line.pieceId.length > 0 && line.pieceId.length <= 256 &&
+      typeof line.text === 'string')
+    .map((line) => ({
+      pieceId: line.pieceId.slice(0, 256),
+      text: line.text.trim().replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120)
+    }))
+    .filter((line) => line.text.length > 0);
+  return lines.length ? { id: dialogue.id, createdAt: dialogue.createdAt, lines } : null;
+}
+
+export function sanitizeFreezoneAIHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .slice(-64)
+    .filter((entry) => entry && typeof entry.id === 'string' &&
+      entry.id.length > 0 && entry.id.length <= 160 &&
+      typeof entry.pieceId === 'string' && entry.pieceId.length > 0 &&
+      Number.isSafeInteger(entry.createdAt) && entry.createdAt >= 0 &&
+      typeof entry.text === 'string')
+    .map((entry) => ({
+      id: entry.id,
+      pieceId: entry.pieceId.slice(0, 256),
+      name: typeof entry.name === 'string' ? entry.name.trim().slice(0, 32) : '',
+      side: Number.isSafeInteger(entry.side) ? entry.side : -1,
+      kind: typeof entry.kind === 'string' ? entry.kind.trim().slice(0, 24) : '',
+      text: entry.text.trim().replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120),
+      createdAt: entry.createdAt
+    }))
+    .filter((entry) => entry.text.length > 0)
+    .slice(-32);
 }
 
 export function incrementFreezoneEliminations(piece, amount = 1) {
@@ -91,10 +162,44 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     if (JSON.stringify(baseOrbs.get(id)) !== JSON.stringify(orb)) mergedOrbs.set(id, orb);
   }
 
+  const baseOrbClaims = new Map((base.orbClaims || []).map((claim) => [claim.orbId, claim]));
+  const localOrbClaims = new Map((local.orbClaims || []).map((claim) => [claim.orbId, claim]));
+  const mergedOrbClaims = new Map((current.orbClaims || []).map((claim) => [claim.orbId, claim]));
+  const conflictedClaims = [];
+  for (const [orbId, claim] of localOrbClaims) {
+    if (baseOrbClaims.has(orbId)) continue;
+    const currentClaim = mergedOrbClaims.get(orbId);
+    if (currentClaim && currentClaim.side !== claim.side) {
+      conflictedClaims.push(claim);
+      continue;
+    }
+    mergedOrbClaims.set(orbId, currentClaim || claim);
+  }
+
   const players = { ...(current.freezonePlayers || {}) };
   for (const [side, player] of Object.entries(local.freezonePlayers || {})) {
     if (JSON.stringify(base.freezonePlayers?.[side]) !== JSON.stringify(player)) {
-      players[side] = player;
+      const conflicted = conflictedClaims.filter((claim) => claim.side === Number(side));
+      if (!conflicted.length) {
+        players[side] = player;
+        continue;
+      }
+      const adjusted = {
+        ...player,
+        orbBalances: { ...(player.orbBalances || {}) }
+      };
+      for (const claim of conflicted) {
+        if (claim.type === 'xp') {
+          adjusted.xp = Math.max(0, (adjusted.xp || 0) - (claim.amount || 0));
+          adjusted.orbBalances.xp = adjusted.xp;
+        } else {
+          adjusted.orbBalances[claim.type] = Math.max(
+            0,
+            (adjusted.orbBalances[claim.type] || 0) - 1
+          );
+        }
+      }
+      players[side] = adjusted;
     }
   }
 
@@ -121,6 +226,27 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     orbCells.add(key);
     return true;
   });
+  const mutantZone = JSON.stringify(base.mutantZone) !== JSON.stringify(local.mutantZone)
+    ? local.mutantZone
+    : current.mutantZone ?? local.mutantZone ?? null;
+  const sharedMusicUrl = base.sharedMusicUrl !== local.sharedMusicUrl
+    ? local.sharedMusicUrl
+    : current.sharedMusicUrl ?? local.sharedMusicUrl ?? '';
+  const aiDialogueCandidates = [current.aiDialogue, local.aiDialogue]
+    .map(sanitizeFreezoneAIDialogue)
+    .filter(Boolean);
+  const aiDialogue = aiDialogueCandidates.reduce((latest, candidate) =>
+    !latest || candidate.createdAt >= latest.createdAt ? candidate : latest, null);
+  const historyById = new Map();
+  for (const entry of [
+    ...sanitizeFreezoneAIHistory(current.aiHistory),
+    ...sanitizeFreezoneAIHistory(local.aiHistory)
+  ]) {
+    historyById.set(entry.id, entry);
+  }
+  const aiHistory = Array.from(historyById.values())
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .slice(-32);
 
   return {
     ...current,
@@ -129,6 +255,14 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     freezonePlayers: players,
     pieces: Array.from(mergedPieces.values()),
     xpOrbs,
+    orbClaims: Array.from(mergedOrbClaims.values()).slice(-1024),
+    mutantZone,
+    mutantZoneInitialized: Boolean(
+      current.mutantZoneInitialized || local.mutantZoneInitialized
+    ),
+    sharedMusicUrl,
+    aiDialogue,
+    aiHistory,
     eliminationRecords: Array.from(records.values())
   };
 }
