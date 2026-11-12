@@ -127,6 +127,116 @@ export function getFreezoneEliminationLeaders(pieces) {
   return { count, leaders: eligible.filter((piece) => piece.eliminations === count) };
 }
 
+export const FREEZONE_RECONNECT_GRACE_MS = 3 * 60 * 1000;
+
+function copyFreezoneSessionState(state) {
+  return {
+    ...state,
+    seats: Array.isArray(state.seats) ? state.seats.map((seat) => seat && { ...seat }) : [],
+    pieces: Array.isArray(state.pieces) ? state.pieces.map((piece) => ({ ...piece })) : [],
+    freezonePlayers: { ...(state.freezonePlayers || {}) },
+    freezoneDepartures: { ...(state.freezoneDepartures || {}) },
+    eliminationRecords: Array.isArray(state.eliminationRecords)
+      ? state.eliminationRecords.map((record) => ({ ...record }))
+      : [],
+    eliminatedSeats: Array.isArray(state.eliminatedSeats) ? [...state.eliminatedSeats] : []
+  };
+}
+
+function expireFreezoneSide(state, side, token) {
+  state.seats[side] = null;
+  state.pieces = state.pieces.filter((piece) => piece.side !== side);
+  delete state.freezonePlayers[side];
+  delete state.freezoneDepartures[token];
+  state.eliminationRecords = state.eliminationRecords.filter((record) => record.side !== side);
+  state.eliminatedSeats = state.eliminatedSeats.filter((seat) => seat !== side);
+}
+
+export function expireFreezoneSessions(state, now = Date.now(), onlineTokens = []) {
+  const next = copyFreezoneSessionState(state || {});
+  const online = new Set(onlineTokens);
+  for (let side = 0; side < next.seats.length; side += 1) {
+    const seat = next.seats[side];
+    if (!seat?.token || seat.bot === true) continue;
+    const departure = next.freezoneDepartures[seat.token];
+    if (online.has(seat.token) && (!departure || departure.expiresAt > now)) continue;
+    const expiresAt = Number(departure?.expiresAt);
+    if (Number.isSafeInteger(expiresAt) && expiresAt <= now) {
+      expireFreezoneSide(next, side, seat.token);
+    }
+  }
+  return next;
+}
+
+export function reconcileFreezonePresence(state, onlinePlayers, now = Date.now()) {
+  const members = Array.isArray(onlinePlayers) ? onlinePlayers : [];
+  const onlineByToken = new Map(
+    members.filter((member) => member && typeof member.token === 'string')
+      .map((member) => [member.token, member])
+  );
+  const next = expireFreezoneSessions(state, now, onlineByToken.keys());
+  for (let side = 0; side < next.seats.length; side += 1) {
+    const seat = next.seats[side];
+    if (!seat?.token || seat.bot === true) continue;
+    const member = onlineByToken.get(seat.token);
+    const departure = next.freezoneDepartures[seat.token];
+    if (member) {
+      if (departure && departure.expiresAt > now) {
+        const existingIds = new Set(next.pieces.map((piece) => piece.id));
+        next.pieces.push(...departure.pieces.filter((piece) => !existingIds.has(piece.id)));
+        if (!next.freezonePlayers[side] && departure.player) {
+          next.freezonePlayers[side] = departure.player;
+        }
+        delete next.freezoneDepartures[seat.token];
+      }
+      if (now - (Number(seat.lastSeenAt) || 0) >= 15000 ||
+          seat.offlineSince || seat.reconnectUntil) {
+        next.seats[side] = {
+          ...seat,
+          lastSeenAt: now,
+          offlineSince: null,
+          reconnectUntil: null
+        };
+      }
+      continue;
+    }
+
+    if (departure) continue;
+    const expiresAt = now + FREEZONE_RECONNECT_GRACE_MS;
+    const pieces = next.pieces.filter((piece) => piece.side === side);
+    const player = next.freezonePlayers[side] || null;
+    next.freezoneDepartures[seat.token] = { side, expiresAt, pieces, player };
+    next.pieces = next.pieces.filter((piece) => piece.side !== side);
+    delete next.freezonePlayers[side];
+    next.seats[side] = {
+      ...seat,
+      offlineSince: now,
+      reconnectUntil: expiresAt
+    };
+  }
+  return next;
+}
+
+export function getFreezonePlayerLeaderboard(records, seats) {
+  const totals = new Map();
+  for (let side = 0; side < (Array.isArray(seats) ? seats.length : 0); side += 1) {
+    if (seats[side]?.token) totals.set(side, 0);
+  }
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!Number.isInteger(record?.side) || record.side < 0 ||
+        !Number.isSafeInteger(record.eliminations) || record.eliminations <= 0) continue;
+    totals.set(record.side, (totals.get(record.side) || 0) + record.eliminations);
+  }
+  return Array.from(totals, ([side, eliminations]) => ({
+    side,
+    name: seats?.[side]?.name || `Player ${side + 1}`,
+    bot: seats?.[side]?.bot === true,
+    eliminations
+  })).sort((left, right) =>
+    right.eliminations - left.eliminations || left.side - right.side
+  );
+}
+
 export function resolveFreezoneVoice(voices, selectedVoiceURI) {
   if (!Array.isArray(voices) || !selectedVoiceURI) return null;
   return voices.find((voice) => voice.voiceURI === selectedVoiceURI) || null;
@@ -177,35 +287,50 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   }
 
   const players = { ...(current.freezonePlayers || {}) };
-  for (const [side, player] of Object.entries(local.freezonePlayers || {})) {
-    if (JSON.stringify(base.freezonePlayers?.[side]) !== JSON.stringify(player)) {
-      const conflicted = conflictedClaims.filter((claim) => claim.side === Number(side));
-      if (!conflicted.length) {
-        players[side] = player;
-        continue;
-      }
-      const adjusted = {
-        ...player,
-        orbBalances: { ...(player.orbBalances || {}) }
-      };
-      for (const claim of conflicted) {
-        if (claim.type === 'xp') {
-          adjusted.xp = Math.max(0, (adjusted.xp || 0) - (claim.amount || 0));
-          adjusted.orbBalances.xp = adjusted.xp;
-        } else {
-          adjusted.orbBalances[claim.type] = Math.max(
-            0,
-            (adjusted.orbBalances[claim.type] || 0) - 1
-          );
-        }
-      }
-      players[side] = adjusted;
+  const playerSides = new Set([
+    ...Object.keys(base.freezonePlayers || {}),
+    ...Object.keys(local.freezonePlayers || {})
+  ]);
+  for (const side of playerSides) {
+    const basePlayer = base.freezonePlayers?.[side];
+    const localPlayer = local.freezonePlayers?.[side];
+    if (JSON.stringify(basePlayer) === JSON.stringify(localPlayer)) continue;
+    if (!localPlayer) {
+      if (JSON.stringify(players[side]) === JSON.stringify(basePlayer)) delete players[side];
+      continue;
     }
+    const conflicted = conflictedClaims.filter((claim) => claim.side === Number(side));
+    if (!conflicted.length) {
+      players[side] = localPlayer;
+      continue;
+    }
+    const adjusted = {
+      ...localPlayer,
+      orbBalances: { ...(localPlayer.orbBalances || {}) }
+    };
+    for (const claim of conflicted) {
+      if (claim.type === 'xp') {
+        adjusted.xp = Math.max(0, (adjusted.xp || 0) - (claim.amount || 0));
+        adjusted.orbBalances.xp = adjusted.xp;
+      } else {
+        adjusted.orbBalances[claim.type] = Math.max(
+          0,
+          (adjusted.orbBalances[claim.type] || 0) - 1
+        );
+      }
+    }
+    players[side] = adjusted;
   }
 
   const baseRecords = new Map((base.eliminationRecords || []).map((record) => [record.id, record]));
   const localRecords = new Map((local.eliminationRecords || []).map((record) => [record.id, record]));
   const records = new Map((current.eliminationRecords || []).map((record) => [record.id, record]));
+  for (const id of baseRecords.keys()) {
+    if (localRecords.has(id)) continue;
+    if (JSON.stringify(records.get(id)) === JSON.stringify(baseRecords.get(id))) {
+      records.delete(id);
+    }
+  }
   for (const [id, record] of localRecords) {
     if (JSON.stringify(baseRecords.get(id)) === JSON.stringify(record)) continue;
     const currentRecord = records.get(id);
@@ -214,6 +339,37 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       ...record,
       eliminations: Math.max(currentRecord?.eliminations || 0, record.eliminations || 0)
     });
+  }
+
+  const baseSeats = Array.isArray(base.seats) ? base.seats : [];
+  const localSeats = Array.isArray(local.seats) ? local.seats : [];
+  const mergedSeats = Array.isArray(current.seats) ? current.seats.slice() : localSeats.slice();
+  for (let side = 0; side < Math.max(baseSeats.length, localSeats.length); side += 1) {
+    const baseSeat = baseSeats[side] || null;
+    const localSeat = localSeats[side] || null;
+    if (JSON.stringify(baseSeat) === JSON.stringify(localSeat)) continue;
+    const currentSeat = mergedSeats[side] || null;
+    const canApply = JSON.stringify(currentSeat) === JSON.stringify(baseSeat) ||
+      JSON.stringify(currentSeat) === JSON.stringify(localSeat);
+    if (canApply) mergedSeats[side] = localSeat;
+  }
+
+  const baseDepartures = base.freezoneDepartures || {};
+  const localDepartures = local.freezoneDepartures || {};
+  const departures = { ...(current.freezoneDepartures || {}) };
+  for (const token of new Set([
+    ...Object.keys(baseDepartures),
+    ...Object.keys(localDepartures)
+  ])) {
+    const baseDeparture = baseDepartures[token];
+    const localDeparture = localDepartures[token];
+    if (JSON.stringify(baseDeparture) === JSON.stringify(localDeparture)) continue;
+    if (!localDeparture) {
+      if (JSON.stringify(departures[token]) === JSON.stringify(baseDeparture)) delete departures[token];
+    } else if (JSON.stringify(departures[token]) === JSON.stringify(baseDeparture) ||
+        JSON.stringify(departures[token]) === JSON.stringify(localDeparture)) {
+      departures[token] = localDeparture;
+    }
   }
 
   const occupied = new Set(
@@ -251,8 +407,12 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   return {
     ...current,
     ...local,
-    seats: current.seats || local.seats || [],
+    seats: mergedSeats,
     freezonePlayers: players,
+    freezoneDepartures: departures,
+    botsEnabled: current.botsEnabled === base.botsEnabled
+      ? Boolean(local.botsEnabled)
+      : Boolean(current.botsEnabled),
     pieces: Array.from(mergedPieces.values()),
     xpOrbs,
     orbClaims: Array.from(mergedOrbClaims.values()).slice(-1024),

@@ -4,11 +4,14 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { addFreezoneAppearance } from './freezoneAppearance.js';
 import {
+  getFreezonePlayerLeaderboard,
   getFreezoneEliminationLeaders,
   incrementFreezoneEliminations,
+  reconcileFreezonePresence,
   sanitizeFreezoneAIHistory,
   sanitizeFreezoneAIDialogue,
-  sanitizeFreezoneProfile
+  sanitizeFreezoneProfile,
+  FREEZONE_RECONNECT_GRACE_MS
 } from './freezoneCustomization.js';
 import {
   freezoneAICandidateId,
@@ -39,7 +42,8 @@ import {
   saveFreeModeState as saveSupabaseFreeModeState,
   saveFreezoneState as saveSupabaseFreezoneState,
   sendMove as sendSupabaseMove,
-  subscribeToRoom
+  subscribeToRoom,
+  subscribeToFreezonePresence
 } from './multiplayerSupabase.js';
 
 /** @type {any} */
@@ -1552,6 +1556,15 @@ export function initWizardChess() {
     let freezoneDialogueId = '';
     let freezoneDialogueRoomCode = '';
     let freezoneAIDialogueBusy = false;
+    let freezoneAIAssistEnabled = false;
+    let freezonePresenceUnsubscribe = null;
+    let freezonePresenceMembers = [];
+    let freezonePresenceReady = false;
+    let freezonePresenceRosterInitialized = false;
+    let freezoneBotTimer = null;
+    let freezoneCameraFocusKey = '';
+    const freezonePresenceInstanceId =
+      `instance-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const freezoneVoiceOutcomes = new Set();
     const FREEZONE_XP_PER_ORB = 1;
     const FREEZONE_XP_COST = 5;
@@ -2005,7 +2018,10 @@ export function initWizardChess() {
         movedPieceIds: Array.isArray(value.movedPieceIds)
           ? Array.from(new Set(value.movedPieceIds.filter((id) => typeof id === 'string')))
           : [],
-        pieceCatalog: Array.from(uniquePatterns.values())
+        pieceCatalog: Array.from(uniquePatterns.values()),
+        sessionStartedAt: Number.isSafeInteger(value.sessionStartedAt) && value.sessionStartedAt > 0
+          ? value.sessionStartedAt
+          : 0
       };
     }
 
@@ -2312,6 +2328,44 @@ export function initWizardChess() {
           ...(state.config.gameMode === 'freezone' ? { boardSize: FREEZONE_BOARD_SIZE } : {})
         }
         : null;
+      const seats = isFreezoneState
+        ? Array.from({ length: Math.min(10, Math.max(0, config?.playerCount || 0)) }, (_, side) => {
+          const seat = state?.seats?.[side];
+          if (!seat || typeof seat.token !== 'string' || !seat.token.length) return null;
+          return {
+            token: seat.token.slice(0, 256),
+            name: typeof seat.name === 'string' ? seat.name.trim().slice(0, 32) : `Player ${side + 1}`,
+            bot: seat.bot === true,
+            lastSeenAt: Number.isSafeInteger(seat.lastSeenAt) ? seat.lastSeenAt : 0,
+            offlineSince: Number.isSafeInteger(seat.offlineSince) ? seat.offlineSince : null,
+            reconnectUntil: Number.isSafeInteger(seat.reconnectUntil) ? seat.reconnectUntil : null,
+            needsArmy: seat.needsArmy === true
+          };
+        })
+        : Array.isArray(state?.seats) ? state.seats : [];
+      const freezoneDepartures = {};
+      if (isFreezoneState && state?.freezoneDepartures &&
+          typeof state.freezoneDepartures === 'object') {
+        for (const [token, departure] of Object.entries(state.freezoneDepartures)) {
+          if (!token || token.length > 256 || !departure ||
+              !Number.isInteger(departure.side) || departure.side < 0 ||
+              departure.side >= 10 || !Number.isSafeInteger(departure.expiresAt)) continue;
+          const departurePieces = normalizeFreeModeState({
+            ...state,
+            pieces: Array.isArray(departure.pieces) ? departure.pieces : [],
+            freezoneDepartures: {}
+          }).pieces.filter((piece) => piece.side === departure.side);
+          const player = departure.player && typeof departure.player === 'object'
+            ? normalizeFreezonePlayer(departure.player)
+            : null;
+          freezoneDepartures[token] = {
+            side: departure.side,
+            expiresAt: departure.expiresAt,
+            pieces: departurePieces,
+            player
+          };
+        }
+      }
       const occupied = new Set(pieces.map((piece) => freeCellKey(piece.r, piece.c)));
       const orbClaims = new Map();
       for (const claim of isFreezoneState && Array.isArray(state?.orbClaims) ? state.orbClaims : []) {
@@ -2358,11 +2412,13 @@ export function initWizardChess() {
           ? validateFreezoneAudioUrl(state.sharedMusicUrl).url
           : '',
         aiDialogue: isFreezoneState ? sanitizeFreezoneAIDialogue(state?.aiDialogue) : null,
+        botsEnabled: isFreezoneState && state?.botsEnabled === true,
         turnIndex: Number.isInteger(state?.turnIndex) ? state.turnIndex : 0,
         movedPieceIds: Array.isArray(state?.movedPieceIds) ? state.movedPieceIds : [],
-        seats: Array.isArray(state?.seats) ? state.seats : [],
+        seats,
         eliminatedSeats: Array.isArray(state?.eliminatedSeats) ? state.eliminatedSeats : [],
         freezonePlayers: state?.freezonePlayers || {},
+        freezoneDepartures,
         xpOrbs,
         eliminationRecords: Array.from(eliminationRecords.values()),
         orbClaims: Array.from(orbClaims.values()).slice(-1024),
@@ -2577,6 +2633,11 @@ export function initWizardChess() {
         seats: customSeats,
         eliminatedSeats: customEliminatedSeats,
         freezonePlayers: Object.fromEntries(freezonePlayerState),
+        freezoneDepartures: customGameConfig?.gameMode === 'freezone'
+          ? freeModeState?.freezoneDepartures || {}
+          : {},
+        botsEnabled: customGameConfig?.gameMode === 'freezone' &&
+          freeModeState?.botsEnabled === true,
         mutantZone: customGameConfig?.gameMode === 'freezone' ? freezoneMutantState : null,
         mutantZoneInitialized: customGameConfig?.gameMode === 'freezone'
           ? freeModeState?.mutantZoneInitialized === true
@@ -2626,6 +2687,34 @@ export function initWizardChess() {
       };
     }
 
+    function getFreezoneOnlineRoster() {
+      const membersByToken = new Map();
+      for (const member of freezonePresenceMembers) {
+        if (!member?.token) continue;
+        const current = membersByToken.get(member.token);
+        if (!current ||
+            (member.instanceId || '').localeCompare(current.instanceId || '') < 0) {
+          membersByToken.set(member.token, member);
+        }
+      }
+      return customSeats.flatMap((seat, side) => {
+        if (!seat?.token) return [];
+        if (seat.bot === true) {
+          return freeModeState?.botsEnabled === true
+            ? [{ side, name: seat.name || `Bot ${side + 1}`, bot: true, online: true }]
+            : [];
+        }
+        const member = membersByToken.get(seat.token);
+        if (!member) return [];
+        return [{
+          side,
+          name: seat.name || member.name || `Player ${side + 1}`,
+          bot: false,
+          online: true
+        }];
+      });
+    }
+
     function publishFreezoneHud() {
       if (!customGameConfig || customGameConfig.gameMode !== 'freezone') {
         window.dispatchEvent(new CustomEvent('wizard-chess-freezone-state', {
@@ -2641,10 +2730,19 @@ export function initWizardChess() {
         : player.movesUsed;
       const ownedPieces = Array.from(freePieces.values())
         .filter((piece) => piece.freeSide === side);
+      const selectedPiece = freePieces.get(selectedFreePieceId);
+      const playerName = side >= 0
+        ? customSeats[side]?.name || `Player ${side + 1}`
+        : 'Spectator';
       window.dispatchEvent(new CustomEvent('wizard-chess-freezone-state', {
         detail: {
           enabled: true,
           isPlayer: side >= 0,
+          playerSide: side,
+          playerName,
+          selectedPieceName: selectedPiece?.freeSide === side
+            ? selectedPiece.freeName || selectedPiece.type
+            : '',
           xp: player.xp,
           xpCost: FREEZONE_XP_COST,
           xpProgress: player.xp >= FREEZONE_XP_COST
@@ -2729,6 +2827,12 @@ export function initWizardChess() {
           eliminationLeaders: getFreezoneEliminationLeaders(
             Array.from(freezoneEliminationRecords.values())
           ),
+          playerEliminationLeaderboard: getFreezonePlayerLeaderboard(
+            Array.from(freezoneEliminationRecords.values()),
+            customSeats
+          ),
+          onlinePlayers: getFreezoneOnlineRoster(),
+          botsEnabled: freeModeState?.botsEnabled === true,
           orbEffects: Object.entries(FREEZONE_ORB_RULES).map(([type, rule]) => ({
             type,
             label: rule.label,
@@ -2736,6 +2840,7 @@ export function initWizardChess() {
             color: `#${rule.color.toString(16).padStart(6, '0')}`
           })),
           boardSize: customGameConfig.boardSize,
+          maxPlayers: customGameConfig.playerCount,
           mutantZone: freezoneMutantState,
           mutantZoneRemainingMs: freezoneMutantState?.remainingMs || 0,
           sharedMusicUrl: freezoneSharedMusicUrl,
@@ -3087,10 +3192,13 @@ export function initWizardChess() {
               envelopeRows: FREEZONE_BASE_ENVELOPE_ROWS,
               envelopeCols: FREEZONE_BASE_ENVELOPE_COLS,
               movesUsed: 0,
-              cooldownUntil: 0
+              cooldownUntil: 0,
+              sessionStartedAt: freezone && armySides.includes(side) ? Date.now() : 0
             }
           ])
         ),
+        botsEnabled: false,
+        freezoneDepartures: {},
         mutantZone: freezone ? createFreezoneMutantZone(boardSize) : null,
         mutantZoneInitialized: freezone,
         sharedMusicUrl: '',
@@ -3135,6 +3243,12 @@ export function initWizardChess() {
         throw new Error(`The starting army for player ${side + 1} needs a king.`);
       }
       const spawnTiles = freezoneSpawnTiles(customGameConfig, side, size, selectedTemplates.length, occupied);
+      const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
+      if (!player.sessionStartedAt) player.sessionStartedAt = Date.now();
+      freezonePlayerState.set(side, player);
+      if (customSeats[side]) {
+        customSeats[side] = { ...customSeats[side], needsArmy: false };
+      }
 
       for (let index = 0; index < selectedTemplates.length; index += 1) {
         const template = selectedTemplates[index];
@@ -3469,6 +3583,7 @@ export function initWizardChess() {
       stopMultiplayerSync();
       gameMode = 'single';
       customPlayerIndex = -1;
+      freezoneCameraFocusKey = '';
       if (freeModeActive) setFreeMode(false, null, true);
       resetChessBoard(true);
       gameOver = false;
@@ -3628,6 +3743,7 @@ export function initWizardChess() {
       }
       freeModeState = normalized;
       if (dialogueToQueue) queueFreezoneAIDialogue(dialogueToQueue);
+      focusFreezoneTeamOnEntry();
       publishFreezoneHud();
       emitFreezoneEntryIfReady();
     }
@@ -3740,6 +3856,16 @@ export function initWizardChess() {
     }
 
     function leaveCurrentGame() {
+      if (freeModeActive && customGameConfig?.gameMode === 'freezone' &&
+          gameMode === 'multi' && freezonePresenceReady) {
+        freezonePresenceMembers = freezonePresenceMembers.filter(
+          (member) => member.token !== playerToken
+        );
+        reconcileCurrentFreezonePresence();
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: 'You left the room. Your pieces are removed; reconnect within 3 minutes to restore your progress.'
+        }));
+      }
       stopMultiplayerSync();
       if (freeModeActive) setFreeMode(false, null, true);
       gameMode = 'single';
@@ -3748,6 +3874,7 @@ export function initWizardChess() {
       customPlayerIndex = -1;
       appliedMoveSeq = 0;
       lastFreezoneSeatTokens = null;
+      freezoneCameraFocusKey = '';
       scriptedGameActive = false;
       freezoneVoiceEntryRoom = null;
       window.history.replaceState({}, '', window.location.pathname);
@@ -6017,9 +6144,10 @@ export function initWizardChess() {
         .slice(0, 128);
     }
 
-    async function requestFreezoneBotAction(controlledPieceId, lastPlayerMove) {
+    async function requestFreezoneAITeammateAction(controlledPieceId, lastPlayerMove) {
       if (gameMode !== 'multi' || customGameConfig?.gameMode !== 'freezone' ||
-          customPlayerIndex < 0 || !roomCode || freezoneAIDialogueBusy) return;
+          customPlayerIndex < 0 || !roomCode || !freezoneAIAssistEnabled ||
+          freezoneAIDialogueBusy) return;
       const side = customPlayerIndex;
       const player = freezonePlayerState.get(side) || normalizeFreezonePlayer({});
       if (player.controlledPieceId !== controlledPieceId) return;
@@ -6041,6 +6169,7 @@ export function initWizardChess() {
           aiHistory: sanitizeFreezoneAIHistory(freeModeState?.aiHistory),
           candidates
         });
+        if (!freezoneAIAssistEnabled) return;
         const decision = normalizeFreezoneAIDecision(
           response,
           candidates,
@@ -6103,6 +6232,19 @@ export function initWizardChess() {
         elapsed: 0,
         duration: 0.7
       };
+    }
+
+    function focusFreezoneTeamOnEntry() {
+      if (customGameConfig?.gameMode !== 'freezone') return;
+      const side = gameMode === 'multi' ? customPlayerIndex : 0;
+      if (side < 0) return;
+      const focusKey = `${roomCode || 'local'}:${side}`;
+      if (freezoneCameraFocusKey === focusKey) return;
+      const piece = Array.from(freePieces.values())
+        .find((candidate) => candidate.freeSide === side);
+      if (!piece) return;
+      focusFreezonePiece(piece);
+      freezoneCameraFocusKey = focusKey;
     }
 
     function advanceCustomTurn() {
@@ -6183,7 +6325,13 @@ export function initWizardChess() {
 
       if (forcedMove) {
         const aiPiece = freePieces.get(forcedMove.pieceId);
-        if (!aiPiece || aiPiece.freeSide !== customPlayerIndex) {
+        const validBotMove = forcedMove.bot === true &&
+          freeModeState?.botsEnabled === true &&
+          customSeats[forcedMove.side]?.bot === true &&
+          aiPiece?.freeSide === forcedMove.side;
+        if (!aiPiece || (forcedMove.bot === true
+          ? !validBotMove
+          : aiPiece.freeSide !== customPlayerIndex)) {
           window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
             detail: 'AI move rejected because its piece is no longer available.'
           }));
@@ -6218,7 +6366,14 @@ export function initWizardChess() {
         return;
       }
 
-      if (gameMode === 'multi' && customPlayerIndex < 0) return;
+      if (gameMode === 'multi' && customPlayerIndex < 0) {
+        if (customGameConfig.gameMode === 'freezone') {
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: 'You are not assigned to a player seat in this room. Rejoin the Freezone arena to move pieces.'
+          }));
+        }
+        return;
+      }
       if (gameMode === 'multi' && customGameConfig.gameMode !== 'freezone' &&
           customPlayerIndex !== customTurnIndex) return;
       const selectedPiece = freePieces.get(selectedFreePieceId);
@@ -6234,10 +6389,22 @@ export function initWizardChess() {
           const allowed = customMovesForPiece(selectedPiece).some(
             (move) => move.r === hitPiece.r && move.c === hitPiece.c
           );
-          if (!allowed) return;
+          if (!allowed) {
+            if (customGameConfig.gameMode === 'freezone') {
+              window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+                detail: 'That opponent piece is not a legal capture destination.'
+              }));
+            }
+            return;
+          }
           hitSquare = { r: hitPiece.r, c: hitPiece.c };
         } else {
-          if (gameMode === 'multi' && hitPiece.freeSide !== customPlayerIndex) return;
+          if (gameMode === 'multi' && hitPiece.freeSide !== customPlayerIndex) {
+            window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+              detail: 'You can only select pieces controlled by your seat.'
+            }));
+            return;
+          }
           activeCamTransition = null;
           selectedFreePieceId = hitPiece.freeId;
           if (customGameConfig.gameMode === 'freezone') {
@@ -6249,6 +6416,7 @@ export function initWizardChess() {
             }
           }
           showSquareHighlights(hitPiece.r, hitPiece.c, customMovesForPiece(hitPiece));
+          publishFreezoneHud();
           if (customGameConfig.gameMode === 'freezone') {
             const details = [
               hitPiece.freeName || hitPiece.type,
@@ -6272,15 +6440,22 @@ export function initWizardChess() {
         return;
       }
       if (!selectedPiece) return;
+      if (gameMode === 'multi' && customGameConfig.gameMode === 'freezone' &&
+          selectedPiece.freeSide !== customPlayerIndex && forcedMove?.bot !== true) {
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: 'You can only move pieces controlled by your seat.'
+        }));
+        return;
+      }
       const move = customMovesForPiece(selectedPiece).find(
         (candidate) => candidate.r === hitSquare.r && candidate.c === hitSquare.c
       );
       if (!move) {
-        if (forcedMove) {
-          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
-            detail: 'AI move rejected because it is no longer legal.'
-          }));
-        }
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: forcedMove
+            ? 'Move rejected because that destination is no longer legal.'
+            : 'That square is not a legal destination; a piece, block, or movement rule prevents it.'
+        }));
         return;
       }
       if (customGameConfig.gameMode === 'freezone' &&
@@ -6402,7 +6577,6 @@ export function initWizardChess() {
             focusPiece.c,
             customMovesForPiece(focusPiece)
           );
-          focusFreezonePiece(focusPiece);
           publishFreezoneHud();
           emitFreezoneOutcomeIfEnded(removedPieces);
         } else {
@@ -6431,26 +6605,38 @@ export function initWizardChess() {
           };
         }
         const saveResult = persistFreeModeState();
-        if (customGameConfig.gameMode === 'freezone' && forcedMove) {
-          if (forcedMove.aiDialogue) {
-            void saveResult.then((result) => {
-              if (!result.ok) return;
-              queueFreezoneAIDialogue(forcedMove.aiDialogue);
-            });
-          }
-        } else if (customGameConfig.gameMode === 'freezone') {
-          void saveResult.then((result) => {
-            if (!result.ok) return;
-            void requestFreezoneBotAction(movingPieceId, {
-              pieceName: selectedPiece.freeName || selectedPiece.type,
-              from: fromSquare,
-              to: { r: move.r, c: move.c },
-              capture: Boolean(captured),
-              capturedPiece: captured ? {
-                name: captured.freeName || captured.type,
-                type: captured.type
-              } : null
-            });
+        if (customGameConfig.gameMode === 'freezone') {
+          void saveResult.then(async (result) => {
+            if (!result.ok) {
+              window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+                detail: 'Move was not synchronized. Restoring the last confirmed room state.'
+              }));
+              try {
+                const room = await fetchRoomState(roomCode);
+                if (room) applyRemoteRoomState(room);
+              } catch (error) {
+                publishMultiplayerStatus(`Could not restore the last confirmed move: ${error.message}`);
+              }
+              return;
+            }
+            if (forcedMove?.aiDialogue) queueFreezoneAIDialogue(forcedMove.aiDialogue);
+            if (forcedMove?.bot) {
+              scheduleFreezoneBotAction(1100);
+              return;
+            }
+            scheduleFreezoneBotAction();
+            if (freezoneAIAssistEnabled && !forcedMove) {
+              void requestFreezoneAITeammateAction(movingPieceId, {
+                pieceName: selectedPiece.freeName || selectedPiece.type,
+                from: fromSquare,
+                to: { r: move.r, c: move.c },
+                capture: Boolean(captured),
+                capturedPiece: captured ? {
+                  name: captured.freeName || captured.type,
+                  type: captured.type
+                } : null
+              });
+            }
           });
         }
         return true;
@@ -6660,6 +6846,193 @@ export function initWizardChess() {
       return playerToken;
     }
 
+    function freezonePresenceName(member) {
+      const seat = customSeats.find((candidate) => candidate?.token === member?.token);
+      return seat?.name || member?.name || 'Player';
+    }
+
+    function reconcileCurrentFreezonePresence() {
+      if (!freeModeActive || customGameConfig?.gameMode !== 'freezone' ||
+          !freezonePresenceReady) return;
+      const nextState = reconcileFreezonePresence(
+        serializeFreeModeState(),
+        freezonePresenceMembers,
+        Date.now()
+      );
+      if (JSON.stringify(normalizeFreeModeState(nextState)) ===
+          JSON.stringify(normalizeFreeModeState(freeModeState))) {
+        publishFreezoneHud();
+        return;
+      }
+      setFreeMode(true, nextState, true);
+      void persistFreeModeState().then((result) => {
+        if (!result.ok) {
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: `Could not sync room presence: ${result.error}`
+          }));
+        }
+      });
+    }
+
+    function handleFreezonePresenceChange(members) {
+      if (!members.some((member) => member.token === playerToken)) return;
+      const previousMembers = freezonePresenceMembers;
+      const previousByToken = new Map(previousMembers.map((member) => [member.token, member]));
+      const nextByToken = new Map();
+      for (const member of members) {
+        if (!member?.token) continue;
+        const current = nextByToken.get(member.token);
+        if (!current ||
+            (member.instanceId || '').localeCompare(current.instanceId || '') < 0) {
+          nextByToken.set(member.token, member);
+        }
+      }
+      const nextMembers = members.filter((member) => member?.token);
+      if (freezonePresenceRosterInitialized) {
+        for (const [token, member] of nextByToken) {
+          if (previousByToken.has(token) || token === playerToken) continue;
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: `${freezonePresenceName(member)} joined the room.`
+          }));
+        }
+        for (const [token, member] of previousByToken) {
+          if (nextByToken.has(token) || token === playerToken) continue;
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: `${freezonePresenceName(member)} left. Their pieces are removed; they can reconnect for 3 minutes.`
+          }));
+        }
+      } else {
+        freezonePresenceRosterInitialized = true;
+        for (const member of nextMembers) {
+          if (member.token === playerToken) continue;
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: `${freezonePresenceName(member)} is online in the room.`
+          }));
+        }
+      }
+      freezonePresenceMembers = nextMembers;
+      freezonePresenceReady = true;
+      reconcileCurrentFreezonePresence();
+      publishFreezoneHud();
+      scheduleFreezoneBotAction();
+    }
+
+    async function setFreezoneBotsEnabled(enabled) {
+      if (!freeModeActive || customGameConfig?.gameMode !== 'freezone' ||
+          gameMode !== 'multi' || customPlayerIndex < 0 || !roomCode) {
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: 'Join a multiplayer Freezone room before changing adversary bots.'
+        }));
+        return;
+      }
+      if ((freeModeState?.botsEnabled === true) === enabled) return;
+      const nextState = serializeFreeModeState();
+      nextState.botsEnabled = enabled;
+      if (enabled) {
+        if (nextState.seats.some((seat) => seat?.bot === true)) return;
+        const side = nextState.seats.findIndex((seat) => !seat?.token);
+        if (side < 0) {
+          window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+            detail: 'No empty seat is available for an adversary bot.'
+          }));
+          return;
+        }
+        nextState.seats[side] = {
+          token: `bot:${roomCode}:${side}`,
+          name: `AI Bot ${side + 1}`,
+          bot: true,
+          needsArmy: true
+        };
+      } else {
+        for (let side = 0; side < nextState.seats.length; side += 1) {
+          const seat = nextState.seats[side];
+          if (seat?.bot !== true) continue;
+          nextState.pieces = nextState.pieces.filter((piece) => piece.side !== side);
+          delete nextState.freezonePlayers[side];
+          delete nextState.freezoneDepartures[seat.token];
+          nextState.eliminationRecords = nextState.eliminationRecords
+            .filter((record) => record.side !== side);
+          nextState.eliminatedSeats = nextState.eliminatedSeats.filter((value) => value !== side);
+          nextState.seats[side] = null;
+        }
+      }
+      setFreeMode(true, nextState, true);
+      if (enabled) {
+        const botSide = customSeats.findIndex((seat) => seat?.bot === true);
+        if (botSide < 0 || !spawnFreezoneArmyForSeat(botSide)) {
+          throw new Error('The adversary bot could not be initialized.');
+        }
+      }
+      const result = await persistFreeModeState();
+      if (!result.ok) {
+        try {
+          const room = await fetchRoomState(roomCode);
+          if (room) applyRemoteRoomState(room);
+        } catch (error) {
+          publishMultiplayerStatus(`Could not reload the room after a failed bot update: ${error.message}`);
+        }
+        return;
+      }
+      publishFreezoneHud();
+      scheduleFreezoneBotAction();
+    }
+
+    function scheduleFreezoneBotAction(delayMs = 900) {
+      if (freezoneBotTimer) {
+        clearTimeout(freezoneBotTimer);
+        freezoneBotTimer = null;
+      }
+      if (!freeModeActive || customGameConfig?.gameMode !== 'freezone' ||
+          gameMode !== 'multi' || !freezonePresenceReady ||
+          freeModeState?.botsEnabled !== true) return;
+      const controller = freezonePresenceMembers
+        .filter((member) => Number.isInteger(member.side) && member.side >= 0 &&
+          customSeats[member.side]?.token === member.token &&
+          customSeats[member.side]?.bot !== true)
+        .slice()
+        .sort((left, right) =>
+          left.side - right.side ||
+          (left.instanceId || '').localeCompare(right.instanceId || '')
+        )[0];
+      if (!controller || controller.token !== playerToken ||
+          controller.instanceId !== freezonePresenceInstanceId) return;
+      const botSide = customSeats.findIndex((seat) => seat?.bot === true);
+      if (botSide < 0) return;
+      const player = freezonePlayerState.get(botSide) || normalizeFreezonePlayer({});
+      const waitMs = Math.max(delayMs, player.cooldownUntil - Date.now() + 50, 0);
+      freezoneBotTimer = setTimeout(() => {
+        freezoneBotTimer = null;
+        if (!freeModeActive || freeModeState?.botsEnabled !== true ||
+            customSeats[botSide]?.bot !== true || isAnimatingMove || freezoneAIDialogueBusy) {
+          scheduleFreezoneBotAction(700);
+          return;
+        }
+        const candidates = Array.from(freePieces.values())
+          .filter((piece) => piece.freeSide === botSide)
+          .flatMap((piece) => customMovesForPiece(piece).map((move) => {
+            const occupant = freePieceAt(move.r, move.c);
+            return {
+              piece,
+              move,
+              capture: Boolean(occupant && occupant.freeSide !== botSide)
+            };
+          }))
+          .sort((left, right) => Number(right.capture) - Number(left.capture));
+        const candidate = candidates[0];
+        if (!candidate) return;
+        handleCustomModeClick(
+          { clientX: 0, clientY: 0 },
+          {
+            pieceId: candidate.piece.freeId,
+            side: botSide,
+            r: candidate.move.r,
+            c: candidate.move.c,
+            bot: true
+          }
+        );
+      }, waitMs);
+    }
+
     function publishMultiplayerStatus(message) {
       const status = document.getElementById('mp-status-msg');
       if (status) status.textContent = message;
@@ -6684,6 +7057,17 @@ export function initWizardChess() {
         roomSyncUnsubscribe();
         roomSyncUnsubscribe = null;
       }
+      if (freezonePresenceUnsubscribe) {
+        freezonePresenceUnsubscribe();
+        freezonePresenceUnsubscribe = null;
+      }
+      if (freezoneBotTimer) {
+        clearTimeout(freezoneBotTimer);
+        freezoneBotTimer = null;
+      }
+      freezonePresenceMembers = [];
+      freezonePresenceReady = false;
+      freezonePresenceRosterInitialized = false;
     }
 
     function applyRemoteRoomState(room) {
@@ -6692,34 +7076,22 @@ export function initWizardChess() {
           Array.isArray(room.free_mode_state.seats)
         ? room.free_mode_state.seats
         : null;
-      if (freezoneSeats) {
-        const joinedSeats = new Map();
-        freezoneSeats.forEach((seat, index) => {
-          if (seat?.token) joinedSeats.set(seat.token, { seat, index });
-        });
-        if (lastFreezoneSeatTokens) {
-          for (const [token, { seat, index }] of joinedSeats) {
-            if (lastFreezoneSeatTokens.has(token) || token === playerToken) continue;
-            const name = seat.name && seat.name !== 'Player' ? seat.name : `Player ${index + 1}`;
-            window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
-              detail: `${name} joined the Freezone arena.`
-            }));
-          }
-        }
-        lastFreezoneSeatTokens = new Set(joinedSeats.keys());
-      } else {
-        lastFreezoneSeatTokens = null;
-      }
+      if (!freezoneSeats) lastFreezoneSeatTokens = null;
       const statusEl = document.getElementById('hud-room-status');
+      const isFreezoneRoom = Boolean(freezoneSeats);
       const bothReady = room.whiteJoined && room.blackJoined;
       if (statusEl) {
-        statusEl.textContent = bothReady ? '2/2 Connected' : 'Waiting for Opponent';
+        statusEl.textContent = isFreezoneRoom
+          ? `${getFreezoneOnlineRoster().length} online`
+          : bothReady ? '2/2 Connected' : 'Waiting for Opponent';
       }
       const mpMsg = document.getElementById('mp-status-msg');
       if (mpMsg && roomCode) {
-        mpMsg.textContent = bothReady
-          ? `Both players connected to Room ${room.code}!`
-          : `Room ${room.code} ready — waiting for second player to join...`;
+        mpMsg.textContent = isFreezoneRoom
+          ? `Freezone room ${room.code} — live presence is shown in the arena.`
+          : bothReady
+            ? `Both players connected to Room ${room.code}!`
+            : `Room ${room.code} ready — waiting for second player to join...`;
       }
       window.dispatchEvent(new CustomEvent('wizard-chess-room-state', { detail: room }));
 
@@ -6732,12 +7104,16 @@ export function initWizardChess() {
           ? room.free_mode_state.seats.findIndex((seat) => seat?.token === playerToken)
           : -1;
         if (!preserveLocalFreezone) setFreeMode(true, room.free_mode_state, true);
+        if (!preserveLocalFreezone && customGameConfig?.gameMode === 'freezone') {
+          reconcileCurrentFreezonePresence();
+        }
         if (!preserveLocalFreezone &&
             customGameConfig?.gameMode === 'freezone' && customPlayerIndex >= 0 &&
+            customSeats[customPlayerIndex]?.needsArmy === true &&
             !Array.from(freePieces.values()).some((piece) => piece.freeSide === customPlayerIndex)) {
           spawnFreezoneArmyForSeat(customPlayerIndex);
           emitFreezoneEntryIfReady();
-          persistFreeModeState();
+          void persistFreeModeState();
         }
         if (!preserveLocalFreezone) emitFreezoneOutcomeIfEnded(previousFreezonePieces);
       } else if (freeModeActive) {
@@ -6778,7 +7154,7 @@ export function initWizardChess() {
       }
     }
 
-    function startMultiplayerSync(code, roomId) {
+    function startMultiplayerSync(code, roomId, isFreezoneRoom, presenceSeat) {
       stopMultiplayerSync();
       roomCode = code;
       let refreshInProgress = false;
@@ -6797,6 +7173,21 @@ export function initWizardChess() {
       };
 
       roomSyncUnsubscribe = subscribeToRoom(roomId, refreshRoom);
+      if (isFreezoneRoom) {
+        freezonePresenceUnsubscribe = subscribeToFreezonePresence(
+          roomId,
+          {
+            token: playerToken,
+            name: presenceSeat?.name || `Player ${customPlayerIndex + 1}`,
+            side: customPlayerIndex,
+            instanceId: freezonePresenceInstanceId
+          },
+          handleFreezonePresenceChange,
+          (error) => publishMultiplayerStatus(
+            `Room presence sync failed: ${error.message || 'Realtime connection error'}`
+          )
+        );
+      }
       roomPollTimer = setInterval(refreshRoom, 3000);
     }
 
@@ -6813,6 +7204,7 @@ export function initWizardChess() {
       customPlayerIndex = Number.isInteger(data.playerIndex) ? data.playerIndex : -1;
       roomCode = data.code;
       appliedMoveSeq = 0;
+      freezoneCameraFocusKey = '';
 
       const codeLabel = document.getElementById('modal-room-code');
       if (codeLabel) codeLabel.textContent = roomCode;
@@ -6820,7 +7212,13 @@ export function initWizardChess() {
       if (createdPanel) createdPanel.style.display = 'block';
 
       resetChessBoard(true);
-      startMultiplayerSync(roomCode, data.room.id);
+      const isFreezoneRoom = data.room?.free_mode_state?.config?.gameMode === 'freezone';
+      startMultiplayerSync(
+        roomCode,
+        data.room.id,
+        isFreezoneRoom,
+        data.room?.free_mode_state?.seats?.[customPlayerIndex]
+      );
       applyRemoteRoomState(data.room);
       window.history.replaceState({}, '', `?room=${roomCode}`);
     }
@@ -7112,6 +7510,27 @@ export function initWizardChess() {
       });
     });
     updateFreeModeUI();
+
+    window.addEventListener('wizard-chess-freezone-toggle-bots', (event) => {
+      void setFreezoneBotsEnabled(event.detail === true).catch((error) => {
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-notice', {
+          detail: error instanceof Error ? error.message : 'Could not change adversary bots.'
+        }));
+      });
+    });
+    window.addEventListener('wizard-chess-freezone-ai-assist', (event) => {
+      freezoneAIAssistEnabled = event.detail === true;
+    });
+    window.addEventListener('pagehide', () => {
+      if (freeModeActive && customGameConfig?.gameMode === 'freezone' &&
+          gameMode === 'multi' && freezonePresenceReady) {
+        freezonePresenceMembers = freezonePresenceMembers.filter(
+          (member) => member.token !== playerToken
+        );
+        reconcileCurrentFreezonePresence();
+      }
+      stopMultiplayerSync();
+    });
 
     document.getElementById('btn-side-toggle')?.addEventListener('click', () => {
       if (gameMode !== 'single') return;

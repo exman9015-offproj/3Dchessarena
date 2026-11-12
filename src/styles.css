@@ -1629,6 +1629,57 @@ body.cinematic-ui-hidden #hud-bottom {
   white-space: nowrap;
 }
 
+.freezone-hud-player,
+.freezone-online-roster {
+  padding: 7px 10px;
+  border: 1px solid rgba(78, 168, 222, 0.26);
+  border-radius: 10px;
+  background: var(--hud-bg);
+  color: #d7eaff;
+  font-size: 0.68rem;
+}
+
+.freezone-online-roster {
+  display: grid;
+  gap: 3px;
+  max-width: 260px;
+}
+
+.freezone-online-roster strong {
+  color: var(--gold-bright);
+}
+
+.freezone-room-presence,
+.freezone-leaderboard {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(78, 168, 222, 0.23);
+  border-radius: 12px;
+  background: rgba(15, 25, 38, 0.55);
+  color: #d7eaff;
+  font-size: 0.78rem;
+}
+
+.freezone-room-presence strong,
+.freezone-leaderboard strong {
+  color: var(--gold-bright);
+}
+
+.freezone-bot-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.freezone-bot-controls span {
+  color: #a9bfd5;
+  font-size: 0.72rem;
+}
+
 .freezone-overlay {
   position: fixed;
   inset: 0;
@@ -2351,8 +2402,15 @@ body.cinematic-ui-hidden #hud-bottom {
 @media (max-width: 768px) {
   .freezone-hud {
     top: 58px;
+    left: 12px;
     right: 12px;
+    align-items: flex-start;
     gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .freezone-online-roster {
+    max-width: min(260px, 55vw);
   }
 
   .freezone-hud .freezone-open {

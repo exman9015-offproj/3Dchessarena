@@ -9,8 +9,12 @@ import {
   FREEZONE_APPEARANCES,
   FREEZONE_VOICE_EVENTS,
   getFreezoneEliminationLeaders,
+  getFreezonePlayerLeaderboard,
+  FREEZONE_RECONNECT_GRACE_MS,
+  expireFreezoneSessions,
   incrementFreezoneEliminations,
   mergeFreezoneRoomState,
+  reconcileFreezonePresence,
   resolveFreezoneVoice,
   sanitizeFreezoneAIHistory,
   sanitizeFreezoneAIDialogue,
@@ -359,6 +363,71 @@ test('Freezone eliminations increment once and retain ties for the leaders displ
   });
 });
 
+test('Freezone player leaderboard includes active players with zero eliminations', () => {
+  assert.deepEqual(getFreezonePlayerLeaderboard(
+    [{ id: 'piece-0', side: 0, eliminations: 2 }],
+    [
+      { token: 'player-0', name: 'Ari' },
+      { token: 'player-1', name: 'Bia' },
+      null
+    ]
+  ), [
+    { side: 0, name: 'Ari', bot: false, eliminations: 2 },
+    { side: 1, name: 'Bia', bot: false, eliminations: 0 }
+  ]);
+});
+
+test('Freezone reconnect grace starts when presence detects departure, not stale last-seen time', () => {
+  const now = 1_000_000;
+  const active = {
+    seats: [{ token: 'player-0', name: 'Ari', lastSeenAt: now - 10 * FREEZONE_RECONNECT_GRACE_MS }],
+    pieces: [{ id: 'king-0', side: 0, r: 4, c: 4 }],
+    freezonePlayers: { 0: { xp: 7, orbBalances: { xp: 3 } } },
+    freezoneDepartures: {},
+    eliminationRecords: [{ id: 'piece-0', side: 0, eliminations: 2 }],
+    eliminatedSeats: []
+  };
+
+  assert.deepEqual(expireFreezoneSessions(active, now), active);
+
+  const departed = reconcileFreezonePresence(active, [], now);
+  assert.equal(departed.pieces.length, 0);
+  assert.equal(departed.freezoneDepartures['player-0'].expiresAt,
+    now + FREEZONE_RECONNECT_GRACE_MS);
+  assert.equal(departed.seats[0].offlineSince, now);
+
+  const reconnected = reconcileFreezonePresence(
+    departed,
+    [{ token: 'player-0', side: 0 }],
+    now + FREEZONE_RECONNECT_GRACE_MS - 1
+  );
+  assert.deepEqual(reconnected.pieces, active.pieces);
+  assert.deepEqual(reconnected.freezonePlayers[0], active.freezonePlayers[0]);
+  assert.equal(reconnected.freezoneDepartures['player-0'], undefined);
+
+  const expired = expireFreezoneSessions(departed, now + FREEZONE_RECONNECT_GRACE_MS);
+  assert.equal(expired.seats[0], null);
+  assert.deepEqual(expired.pieces, []);
+  assert.equal(expired.freezonePlayers[0], undefined);
+  assert.equal(expired.eliminationRecords.length, 0);
+});
+
+test('Freezone presence and AI controls are wired with bots disabled by default', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const multiplayer = fs.readFileSync(path.join(ROOT, 'src/multiplayerSupabase.js'), 'utf-8');
+
+  assert.ok(engine.includes('function handleFreezonePresenceChange(members)'));
+  assert.ok(engine.includes('subscribeToFreezonePresence('));
+  assert.ok(engine.includes('Their pieces are removed; they can reconnect for 3 minutes.'));
+  assert.ok(engine.includes('botsEnabled: false'));
+  assert.ok(engine.includes('let freezoneAIAssistEnabled = false;'));
+  assert.ok(panel.includes("readLocalSetting('freezone-ai-assist-enabled') === 'true'"));
+  assert.ok(panel.includes('Player elimination ranking'));
+  assert.ok(multiplayer.includes(".on('presence', { event: 'join' }, publishPresence)"));
+  assert.ok(multiplayer.includes(".on('presence', { event: 'leave' }, publishPresence)"));
+});
+
 test('Freezone speech remains silent when disabled or when a selected voice is missing', () => {
   const voices = [{ voiceURI: 'available', name: 'Available voice' }];
   assert.equal(resolveFreezoneVoice(voices, 'missing'), null);
@@ -462,7 +531,7 @@ test('Freezone shop stays open through repeated HUD updates', () => {
   assert.ok(!handler.includes('if (detail?.enabled) setOpen(false)'));
 });
 
-test('Freezone selection persists for repeat moves and camera reframes only after a move', () => {
+test('Freezone selection persists for repeat moves and entry camera focuses the player team', () => {
   const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
   const selectionStart = engine.indexOf('selectedFreePieceId = hitPiece.freeId;', engine.indexOf('function handleCustomModeClick'));
   const selectionEnd = engine.indexOf('if (!hitSquare)', selectionStart);
@@ -470,8 +539,13 @@ test('Freezone selection persists for repeat moves and camera reframes only afte
 
   assert.ok(selection.includes('showSquareHighlights(hitPiece.r, hitPiece.c, customMovesForPiece(hitPiece))'));
   assert.ok(!selection.includes('focusFreezonePiece(hitPiece)'));
-  assert.match(engine, /showSquareHighlights\(\s*focusPiece\.r,/);
-  assert.ok(engine.includes('focusFreezonePiece(focusPiece);'));
+  const focusStart = engine.indexOf('function focusFreezoneTeamOnEntry()');
+  const focusEnd = engine.indexOf('function advanceCustomTurn()', focusStart);
+  const focusOnEntry = engine.slice(focusStart, focusEnd);
+  assert.ok(focusOnEntry.includes('focusFreezonePiece(piece);'));
+  assert.ok(engine.includes('focusFreezoneTeamOnEntry();'));
+  assert.ok(engine.includes('You are not assigned to a player seat in this room.'));
+  assert.ok(engine.includes('That square is not a legal destination; a piece, block, or movement rule prevents it.'));
   assert.ok(engine.includes('player.controlledPieceId'));
   assert.ok(engine.includes('requestFreezoneAIMove'));
   assert.ok(engine.includes('handleCustomModeClick(\n          { clientX: -1, clientY: -1 }'));

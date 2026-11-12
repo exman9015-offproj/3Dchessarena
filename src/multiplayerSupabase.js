@@ -1,4 +1,7 @@
-import { mergeFreezoneRoomState } from './freezoneCustomization.js';
+import {
+  expireFreezoneSessions,
+  mergeFreezoneRoomState
+} from './freezoneCustomization.js';
 import { getFreezoneAIRequestSettings } from './freezoneAISettings.js';
 
 import { createClient } from '@supabase/supabase-js';
@@ -278,13 +281,57 @@ export async function joinRoom(code, playerToken) {
   let room = await fetchRoom(code);
   if (!room) return { ok: false, error: 'Sala não encontrada. Confira o código do convite.' };
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const freezone = room.free_mode_state?.config?.gameMode === 'freezone';
     const customSeats = room.free_mode_state?.config
       ? room.free_mode_state.seats || []
       : null;
     if (customSeats) {
+      if (freezone) {
+        const cleanedState = expireFreezoneSessions(room.free_mode_state);
+        if (JSON.stringify(cleanedState) !== JSON.stringify(room.free_mode_state)) {
+          let cleanup = client.from('rooms')
+            .update({
+              free_mode_state: cleanedState,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', room.id);
+          if (room.updated_at) cleanup = cleanup.eq('updated_at', room.updated_at);
+          const { error } = await cleanup;
+          throwIfError(error);
+          room = await fetchRoom(code);
+          if (!room) break;
+          continue;
+        }
+      }
+
       const existingSeat = customSeats.findIndex((seat) => seat?.token === playerToken);
       if (existingSeat >= 0) {
+        if (freezone) {
+          const nextSeats = customSeats.slice();
+          nextSeats[existingSeat] = {
+            ...nextSeats[existingSeat],
+            lastSeenAt: Date.now(),
+            offlineSince: null,
+            reconnectUntil: null
+          };
+          if (JSON.stringify(nextSeats[existingSeat]) !== JSON.stringify(customSeats[existingSeat])) {
+            let update = client.from('rooms')
+              .update({
+                free_mode_state: { ...room.free_mode_state, seats: nextSeats },
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', room.id);
+            if (room.updated_at) update = update.eq('updated_at', room.updated_at);
+            const { data, error } = await update.select('id').maybeSingle();
+            throwIfError(error);
+            if (!data) {
+              room = await fetchRoom(code);
+              if (!room) break;
+              continue;
+            }
+          }
+        }
         return {
           ok: true,
           code,
@@ -297,7 +344,14 @@ export async function joinRoom(code, playerToken) {
       const playerIndex = customSeats.findIndex((seat) => !seat?.token);
       if (playerIndex < 0) return { ok: false, error: 'Esta sala já está cheia.' };
       const nextSeats = customSeats.slice();
-      nextSeats[playerIndex] = { token: playerToken, name: 'Player' };
+      nextSeats[playerIndex] = freezone
+        ? {
+          token: playerToken,
+          name: `Player ${playerIndex + 1}`,
+          lastSeenAt: Date.now(),
+          needsArmy: true
+        }
+        : { token: playerToken, name: 'Player' };
       const freeModeState = { ...room.free_mode_state, seats: nextSeats };
       let update = client
         .from('rooms')
@@ -502,6 +556,54 @@ export function subscribeToRoom(roomId, onChange) {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, onChange)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'moves', filter: `room_id=eq.${roomId}` }, onChange)
     .subscribe();
+
+  return () => {
+    void client.removeChannel(channel);
+  };
+}
+
+export function subscribeToFreezonePresence(roomId, member, onChange, onError = () => {}) {
+  const client = requireClient();
+  const channel = client.channel(`wizard-chess-freezone-presence-${roomId}`, {
+    config: { presence: { key: member.token } }
+  });
+  const publishPresence = () => {
+    const presenceState = channel.presenceState();
+    const members = [];
+    for (const [key, presences] of Object.entries(presenceState)) {
+      for (const presence of presences) {
+        members.push({
+          token: typeof presence.token === 'string' ? presence.token : key,
+          name: typeof presence.name === 'string' ? presence.name : 'Player',
+          side: Number.isInteger(presence.side) ? presence.side : -1,
+          instanceId: typeof presence.instanceId === 'string' ? presence.instanceId : ''
+        });
+      }
+    }
+    onChange(members);
+  };
+
+  channel
+    .on('presence', { event: 'sync' }, publishPresence)
+    .on('presence', { event: 'join' }, publishPresence)
+    .on('presence', { event: 'leave' }, publishPresence)
+    .subscribe(async (status, error) => {
+      if (status === 'SUBSCRIBED') {
+        try {
+          await channel.track({
+            token: member.token,
+            name: member.name,
+            side: member.side,
+            instanceId: member.instanceId,
+            onlineAt: Date.now()
+          });
+        } catch (trackError) {
+          onError(trackError);
+        }
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        onError(error || new Error(`Freezone presence channel status: ${status}`));
+      }
+    });
 
   return () => {
     void client.removeChannel(channel);

@@ -91,10 +91,18 @@ type FreezoneOrbEffect = {
   color: string;
 };
 type FreezoneUpgrade = Exclude<FreezoneOrbEffect['type'], 'xp'>;
+type FreezoneOnlinePlayer = {
+  side: number;
+  name: string;
+  bot: boolean;
+  online: true;
+};
 
 type FreezoneHud = {
   enabled: boolean;
   isPlayer: boolean;
+  playerName: string;
+  selectedPieceName: string;
   xp: number;
   xpCost: number;
   xpProgress: number;
@@ -119,10 +127,19 @@ type FreezoneHud = {
   movesUsed: number;
   cooldownMs: number;
   boardSize: number;
+  maxPlayers: number;
   roomCode?: string;
   pieceOptions: FreezonePattern[];
   publicPieces: FreezoneOwnedPiece[];
   eliminationLeaders: { count: number; leaders: Array<{ id: string; name: string }> };
+  playerEliminationLeaderboard: Array<{
+    side: number;
+    name: string;
+    bot: boolean;
+    eliminations: number;
+  }>;
+  onlinePlayers: FreezoneOnlinePlayer[];
+  botsEnabled: boolean;
 };
 
 type FreezoneApiResult = { ok: boolean; code?: string; error?: string };
@@ -207,6 +224,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [aiVoiceEnabled, setAIVoiceEnabled] = useState(
     () => readLocalSetting('freezone-ai-voice-enabled') === 'true'
   );
+  const [aiAssistEnabled, setAIAssistEnabled] = useState(
+    () => readLocalSetting('freezone-ai-assist-enabled') === 'true'
+  );
   const [aiSettings, setAISettings] = useState(() => getFreezoneAISettings());
   const [aiVoiceStatus, setAIVoiceStatus] = useState('');
   const [aiVoiceReady, setAIVoiceReady] = useState(false);
@@ -231,6 +251,15 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const aiVoiceQueueRef = useRef(Promise.resolve());
   const aiVoiceEnabledRef = useRef(aiVoiceEnabled);
   const voiceCooldowns = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('freezone-ai-assist-enabled', String(aiAssistEnabled));
+    } catch {}
+    window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-assist', {
+      detail: aiAssistEnabled
+    }));
+  }, [aiAssistEnabled]);
 
   const updateAISettings = (change: Partial<ReturnType<typeof getFreezoneAISettings>>) => {
     const next = {
@@ -846,6 +875,17 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
           <span className="freezone-hud-stats">
             XP {hud.xp} · Army {hud.pieces}/{hud.capacity}
           </span>
+          <span className="freezone-hud-player">
+            {hud.playerName}{hud.selectedPieceName ? ` · Selected: ${hud.selectedPieceName}` : ''}
+          </span>
+          <div className="freezone-online-roster" aria-label="Players currently online">
+            <strong>Online {hud.onlinePlayers.length} · Max {hud.maxPlayers}</strong>
+            {hud.onlinePlayers.map((player) => (
+              <span key={player.side}>
+                {player.name} · Team {player.side + 1}{player.bot ? ' · Bot' : ''} · Online
+              </span>
+            ))}
+          </div>
           <button
             type="button"
             className="hud-btn freezone-open"
@@ -914,6 +954,36 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   </button>
                 )}
               </div>
+              <div className="freezone-room-presence" aria-label="Room players and controls">
+                <strong>Players online: {hud.onlinePlayers.length} · Maximum seats: {hud.maxPlayers}</strong>
+                {hud.onlinePlayers.length ? hud.onlinePlayers.map((player) => (
+                  <span key={player.side}>
+                    Team {player.side + 1}: {player.name}{player.bot ? ' (Bot)' : ''} — Online
+                  </span>
+                )) : <span>No other players are online.</span>}
+              </div>
+              {roomCode && hud.isPlayer && (
+                <div className="freezone-bot-controls">
+                  <button
+                    type="button"
+                    aria-pressed={hud.botsEnabled}
+                    onClick={() => window.dispatchEvent(new CustomEvent(
+                      'wizard-chess-freezone-toggle-bots',
+                      { detail: !hud.botsEnabled }
+                    ))}
+                  >
+                    Adversary bot: {hud.botsEnabled ? 'On' : 'Off'}
+                  </button>
+                  <span>Scripted locally; no AI API request. One bot uses an empty seat.</span>
+                  <button
+                    type="button"
+                    aria-pressed={aiAssistEnabled}
+                    onClick={() => setAIAssistEnabled((enabled) => !enabled)}
+                  >
+                    AI teammate moves: {aiAssistEnabled ? 'On' : 'Off'}
+                  </button>
+                </div>
+              )}
               <div
                 className="freezone-xp-progress"
                 role="progressbar"
@@ -935,11 +1005,15 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 Yellow {hud.upgradeLevels.yellow} ·
                 Purple {hud.upgradeLevels.purple} · White {hud.upgradeLevels.white}
               </p>
-              {hud.eliminationLeaders.count > 0 && (
-                <p className="freezone-hint" aria-live="polite">
-                  Most eliminations ({hud.eliminationLeaders.count}):{' '}
-                  {hud.eliminationLeaders.leaders.map((piece) => piece.name).join(' · ')}
-                </p>
+              {hud.playerEliminationLeaderboard.length > 0 && (
+                <div className="freezone-leaderboard" aria-label="Player elimination ranking">
+                  <strong>Eliminations</strong>
+                  {hud.playerEliminationLeaderboard.map((player) => (
+                    <span key={player.side}>
+                      {player.name}{player.bot ? ' (Bot)' : ''}: {player.eliminations}
+                    </span>
+                  ))}
+                </div>
               )}
               {!hud.isPlayer ? (
                 <p className="freezone-hint">Spectators cannot buy or upgrade pieces.</p>
@@ -1454,7 +1528,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   <article className="freezone-room" key={room.id}>
                     <div>
                       <strong>{room.name}{room.isMainArena ? ' · Main' : ''}</strong>
-                      <span>{room.joined}/{room.capacity} players · Code {room.code}</span>
+                      <span>{room.joined} seats claimed · Maximum {room.capacity} · Code {room.code}</span>
                     </div>
                     <button
                       type="button"
@@ -1510,6 +1584,10 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         >
           <strong>{inspectedPiece.name}</strong>
           <span>{inspectedPiece.title || 'Piece'} · {inspectedPiece.type} · {FREEZONE_APPEARANCES.find(({ id }) => id === inspectedPiece.appearance)?.label || 'Classic'}</span>
+          <span>
+            Controlled by: {hud?.onlinePlayers.find((player) => player.side === inspectedPiece.side)?.name ||
+              `Team ${inspectedPiece.side + 1}`}
+          </span>
           {inspectedPiece.description && <p>{inspectedPiece.description}</p>}
           {inspectedPiece.personality && <p>Personality: {inspectedPiece.personality}</p>}
           <span>{FREEZONE_AI_LANGUAGES.find(({ id }) => id === inspectedPiece.language)?.label || inspectedPiece.language} · {FREEZONE_AI_VOICES.find(({ id }) => id === inspectedPiece.aiVoice)?.label || inspectedPiece.aiVoice}</span>
