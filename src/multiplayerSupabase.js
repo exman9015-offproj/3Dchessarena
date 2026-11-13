@@ -1,6 +1,7 @@
 import {
   expireFreezoneSessions,
-  mergeFreezoneRoomState
+  mergeFreezoneRoomState,
+  normalizeFreezoneRoomPublication
 } from './freezoneCustomization.js';
 import { getFreezoneAIRequestSettings } from './freezoneAISettings.js';
 
@@ -171,6 +172,12 @@ export async function listPublicRooms(limit = 40) {
   return (data || []).map((room) => {
     const state = room.free_mode_state || {};
     const config = state.config || null;
+    const arenaFormat = config?.gameMode === 'freezone'
+      ? (typeof config.arenaFormat === 'string' ? config.arenaFormat : 'square')
+      : 'square';
+    const publication = config?.gameMode === 'freezone'
+      ? normalizeFreezoneRoomPublication(config.publication, state.arenaName || config.arenaName)
+      : null;
     const seats = Array.isArray(state.seats) ? state.seats : null;
     const kind = config?.gameMode === 'freezone' ? 'freezone' : config ? 'custom' : 'chess';
     const joined = seats
@@ -184,8 +191,23 @@ export async function listPublicRooms(limit = 40) {
       updatedAt: room.updated_at,
       createdAt: room.created_at,
       kind,
-      name: state.arenaName || config?.arenaName ||
+      name: publication?.name || state.arenaName || config?.arenaName ||
         (kind === 'freezone' ? 'Freezone Arena' : kind === 'custom' ? 'Custom Chess Room' : 'Open Chess Match'),
+      publication: publication
+        ? {
+          description: publication.description,
+          thumbnailUrl: publication.thumbnailUrl,
+          wallpaperUrl: publication.wallpaperUrl || '',
+          tags: publication.tags,
+          theme: publication.theme || {
+            surface: '#dcd3c2',
+            edge: '#14171f',
+            team: '#d4af37',
+            wallpaperUrl: ''
+          }
+        }
+        : null,
+      format: config?.gameMode === 'freezone' ? arenaFormat : null,
       isMainArena: state.mainArena === true,
       joined,
       capacity

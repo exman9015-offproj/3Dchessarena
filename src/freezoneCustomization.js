@@ -1,3 +1,9 @@
+import {
+  FREEZONE_ALLY_COST,
+  FREEZONE_ALLY_ROLES,
+  validateFreezoneThumbnailUrl
+} from './freezoneRules.js';
+
 export const FREEZONE_APPEARANCES = [
   { id: 'frog', label: 'Frog' },
   { id: 'eagle', label: 'Eagle' },
@@ -25,6 +31,113 @@ export const FREEZONE_VOICE_EVENTS = [
   { id: 'defeat', label: 'Defeat' },
   { id: 'vulnerable', label: 'Piece threatened' }
 ];
+
+export const FREEZONE_MAX_BOTS = 2;
+export const FREEZONE_ROOM_CONFIG_VERSION = 1;
+export const FREEZONE_ROOM_THEME_DEFAULTS = {
+  surface: '#dcd3c2',
+  edge: '#14171f',
+  team: '#d4af37',
+  wallpaperUrl: ''
+};
+export const FREEZONE_ARENA_FORMATS = [
+  { id: 'square', label: 'Square' },
+  { id: 'triangle', label: 'Triangle' },
+  { id: 'hexagonal', label: 'Hexagonal' }
+];
+export const FREEZONE_ROOM_TAGS = [
+  'classic',
+  'fast',
+  'exploration',
+  'custom-pieces',
+  'orbs',
+  'team-play',
+  'beginner',
+  'competitive'
+];
+
+/** @returns {'square' | 'triangle' | 'hexagonal'} */
+export function normalizeFreezoneArenaFormat(value) {
+  const format = typeof value === 'string' ? value.trim().toLowerCase() : 'square';
+  return FREEZONE_ARENA_FORMATS.some((entry) => entry.id === format)
+    ? format
+    : 'square';
+}
+
+function normalizeHexColor(value, fallback) {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  if (/^#[0-9a-fA-F]{3}$/.test(candidate) || /^#[0-9a-fA-F]{6}$/.test(candidate)) {
+    return candidate.toLowerCase();
+  }
+  return fallback;
+}
+
+export function normalizeFreezoneRoomTheme(value = {}) {
+  const raw = value && typeof value === 'object' ? value : {};
+  const theme = {
+    surface: normalizeHexColor(raw.surface ?? raw.surfaceColor, FREEZONE_ROOM_THEME_DEFAULTS.surface),
+    edge: normalizeHexColor(raw.edge ?? raw.borderColor ?? raw.edgeColor, FREEZONE_ROOM_THEME_DEFAULTS.edge),
+    team: normalizeHexColor(raw.team ?? raw.teamColor ?? raw.accent, FREEZONE_ROOM_THEME_DEFAULTS.team),
+    wallpaperUrl: ''
+  };
+  const wallpaperUrl = typeof raw.wallpaperUrl === 'string' ? raw.wallpaperUrl.trim() : '';
+  const validation = validateFreezoneThumbnailUrl(wallpaperUrl);
+  theme.wallpaperUrl = validation.ok ? validation.url : '';
+  return theme;
+}
+
+export function normalizeFreezoneRoomPublication(value = {}, fallbackName = 'Freezone Arena') {
+  const raw = value && typeof value === 'object' ? value : {};
+  const candidateUrl = typeof raw.thumbnailUrl === 'string' ? raw.thumbnailUrl.trim() : '';
+  const thumbnailValidation = validateFreezoneThumbnailUrl(candidateUrl);
+  const thumbnailUrl = thumbnailValidation.ok ? thumbnailValidation.url : '';
+  const validTags = new Set(FREEZONE_ROOM_TAGS);
+  const tags = Array.from(new Set(
+    (Array.isArray(raw.tags) ? raw.tags : [])
+      .filter((tag) => typeof tag === 'string' && validTags.has(tag))
+  )).slice(0, 5);
+  const theme = normalizeFreezoneRoomTheme(raw.theme || raw.roomTheme || raw.palette || raw.colors || {});
+  return {
+    ...raw,
+    version: FREEZONE_ROOM_CONFIG_VERSION,
+    name: (typeof raw.name === 'string' && raw.name.trim()
+      ? raw.name
+      : fallbackName).trim().slice(0, 60),
+    description: typeof raw.description === 'string'
+      ? raw.description.trim().slice(0, 280)
+      : '',
+    thumbnailUrl,
+    wallpaperUrl: theme.wallpaperUrl,
+    tags,
+    theme
+  };
+}
+
+export function applyFreezoneAllyPurchase(player = {}, ally) {
+  if (!ally || typeof ally.id !== 'string' || typeof ally.pieceId !== 'string' ||
+      !FREEZONE_ALLY_ROLES.includes(ally.role)) {
+    return { ok: false, error: 'Choose a valid allied bot role.' };
+  }
+  const allies = Array.isArray(player.allies) ? player.allies : [];
+  if (allies.some((current) => current.id === ally.id || current.pieceId === ally.pieceId)) {
+    return { ok: false, error: 'This allied bot has already been recruited.' };
+  }
+  const botOrbs = Math.max(0, Math.floor(Number(player.orbBalances?.bot) || 0));
+  if (botOrbs < FREEZONE_ALLY_COST) {
+    return {
+      ok: false,
+      error: `Collect ${FREEZONE_ALLY_COST - botOrbs} more bot orbs to recruit an ally.`
+    };
+  }
+  return {
+    ok: true,
+    player: {
+      ...player,
+      orbBalances: { ...(player.orbBalances || {}), bot: botOrbs - FREEZONE_ALLY_COST },
+      allies: [...allies, { ...ally }]
+    }
+  };
+}
 
 export const FREEZONE_AI_LANGUAGES = [
   { id: 'pt-BR', label: 'Português (Brasil)' },
@@ -247,6 +360,102 @@ export function shouldSpeakFreezoneVoice(enabled, text, voiceAvailable) {
     (voiceAvailable === undefined || voiceAvailable === true);
 }
 
+export function configureFreezoneBots(state, enabled, roomCode = '') {
+  const next = {
+    ...(state || {}),
+    seats: Array.isArray(state?.seats) ? state.seats.slice() : [],
+    pieces: Array.isArray(state?.pieces) ? state.pieces.slice() : [],
+    freezonePlayers: { ...(state?.freezonePlayers || {}) },
+    freezoneDepartures: { ...(state?.freezoneDepartures || {}) },
+    eliminationRecords: Array.isArray(state?.eliminationRecords)
+      ? state.eliminationRecords.slice()
+      : [],
+    eliminatedSeats: Array.isArray(state?.eliminatedSeats)
+      ? state.eliminatedSeats.slice()
+      : [],
+    orbClaims: Array.isArray(state?.orbClaims) ? state.orbClaims.slice() : []
+  };
+  const botSides = next.seats.flatMap((seat, side) => seat?.bot === true ? [side] : []);
+  const removedSides = [];
+  const addedSides = [];
+
+  if (!enabled) {
+    for (const side of botSides) {
+      const seat = next.seats[side];
+      removedSides.push(side);
+      next.seats[side] = null;
+      delete next.freezonePlayers[side];
+      delete next.freezoneDepartures[seat.token];
+    }
+    const removed = new Set(removedSides);
+    const removedPieceIds = new Set(
+      next.pieces.filter((piece) => removed.has(piece.side)).map((piece) => piece.id)
+    );
+    next.pieces = next.pieces.filter((piece) => !removed.has(piece.side));
+    next.eliminationRecords = next.eliminationRecords.filter((record) =>
+      !removed.has(record.side)
+    );
+    next.eliminatedSeats = next.eliminatedSeats.filter((side) => !removed.has(side));
+    next.orbClaims = next.orbClaims.filter((claim) => !removed.has(claim.side));
+    if (Array.isArray(next.movedPieceIds)) {
+      next.movedPieceIds = next.movedPieceIds.filter((id) => !removedPieceIds.has(id));
+    }
+    next.botsEnabled = false;
+    return { ok: true, state: next, addedSides, removedSides };
+  }
+
+  const excessSides = botSides.slice(FREEZONE_MAX_BOTS);
+  for (const side of excessSides) {
+    const seat = next.seats[side];
+    removedSides.push(side);
+    next.seats[side] = null;
+    delete next.freezonePlayers[side];
+    delete next.freezoneDepartures[seat.token];
+  }
+  const allowedBotSides = new Set(botSides.slice(0, FREEZONE_MAX_BOTS));
+  if (excessSides.length) {
+    const removed = new Set(excessSides);
+    const removedPieceIds = new Set(
+      next.pieces.filter((piece) => removed.has(piece.side)).map((piece) => piece.id)
+    );
+    next.pieces = next.pieces.filter((piece) => !removed.has(piece.side));
+    next.eliminationRecords = next.eliminationRecords.filter((record) =>
+      !removed.has(record.side)
+    );
+    next.eliminatedSeats = next.eliminatedSeats.filter((side) => !removed.has(side));
+    next.orbClaims = next.orbClaims.filter((claim) => !removed.has(claim.side));
+    if (Array.isArray(next.movedPieceIds)) {
+      next.movedPieceIds = next.movedPieceIds.filter((id) => !removedPieceIds.has(id));
+    }
+  }
+
+  for (let side = 0; side < next.seats.length &&
+      allowedBotSides.size < FREEZONE_MAX_BOTS; side += 1) {
+    if (next.seats[side]?.token) continue;
+    next.seats[side] = {
+      token: `bot:${roomCode || 'freezone'}:${side}`,
+      name: `AI Bot ${side + 1}`,
+      bot: true,
+      needsArmy: true
+    };
+    allowedBotSides.add(side);
+    addedSides.push(side);
+  }
+
+  if (!allowedBotSides.size) {
+    return {
+      ok: false,
+      state: { ...next, botsEnabled: false },
+      addedSides,
+      removedSides,
+      error: 'No empty seat is available for an adversary bot.'
+    };
+  }
+
+  next.botsEnabled = true;
+  return { ok: true, state: next, addedSides, removedSides };
+}
+
 export function mergeFreezoneRoomState(baseState, localState, currentState) {
   const base = baseState || {};
   const local = localState || {};
@@ -291,6 +500,28 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     ...Object.keys(base.freezonePlayers || {}),
     ...Object.keys(local.freezonePlayers || {})
   ]);
+  const mergeAlliedRoster = (baseAllies = [], localAllies = [], currentAllies = []) => {
+    const baseById = new Map((Array.isArray(baseAllies) ? baseAllies : [])
+      .filter((ally) => ally && typeof ally.id === 'string')
+      .map((ally) => [ally.id, ally]));
+    const localById = new Map((Array.isArray(localAllies) ? localAllies : [])
+      .filter((ally) => ally && typeof ally.id === 'string')
+      .map((ally) => [ally.id, ally]));
+    const mergedById = new Map((Array.isArray(currentAllies) ? currentAllies : [])
+      .filter((ally) => ally && typeof ally.id === 'string')
+      .map((ally) => [ally.id, ally]));
+    for (const [id, ally] of baseById) {
+      if (!localById.has(id) && JSON.stringify(mergedById.get(id)) === JSON.stringify(ally)) {
+        mergedById.delete(id);
+      }
+    }
+    for (const [id, ally] of localById) {
+      if (JSON.stringify(baseById.get(id)) !== JSON.stringify(ally)) {
+        mergedById.set(id, mergedById.get(id) || ally);
+      }
+    }
+    return Array.from(mergedById.values());
+  };
   for (const side of playerSides) {
     const basePlayer = base.freezonePlayers?.[side];
     const localPlayer = local.freezonePlayers?.[side];
@@ -300,8 +531,14 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       continue;
     }
     const conflicted = conflictedClaims.filter((claim) => claim.side === Number(side));
+    const currentPlayer = players[side] || {};
+    const allies = mergeAlliedRoster(
+      basePlayer?.allies || [],
+      localPlayer.allies || [],
+      currentPlayer.allies || []
+    );
     if (!conflicted.length) {
-      players[side] = localPlayer;
+      players[side] = { ...currentPlayer, ...localPlayer, allies };
       continue;
     }
     const adjusted = {
@@ -309,17 +546,21 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       orbBalances: { ...(localPlayer.orbBalances || {}) }
     };
     for (const claim of conflicted) {
-      if (claim.type === 'xp') {
-        adjusted.xp = Math.max(0, (adjusted.xp || 0) - (claim.amount || 0));
+      const xpAmount = Number.isFinite(claim.xpAmount)
+        ? claim.xpAmount
+        : claim.type === 'xp' ? claim.amount || 0 : 0;
+      if (xpAmount) {
+        adjusted.xp = Math.max(0, (adjusted.xp || 0) - xpAmount);
         adjusted.orbBalances.xp = adjusted.xp;
-      } else {
+      }
+      if (claim.type !== 'xp') {
         adjusted.orbBalances[claim.type] = Math.max(
           0,
           (adjusted.orbBalances[claim.type] || 0) - 1
         );
       }
     }
-    players[side] = adjusted;
+    players[side] = { ...adjusted, allies };
   }
 
   const baseRecords = new Map((base.eliminationRecords || []).map((record) => [record.id, record]));
@@ -385,9 +626,22 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   const mutantZone = JSON.stringify(base.mutantZone) !== JSON.stringify(local.mutantZone)
     ? local.mutantZone
     : current.mutantZone ?? local.mutantZone ?? null;
-  const sharedMusicUrl = base.sharedMusicUrl !== local.sharedMusicUrl
+  const localMusicUrlChanged = base.sharedMusicUrl !== local.sharedMusicUrl;
+  const remoteMusicUrlChanged = base.sharedMusicUrl !== current.sharedMusicUrl;
+  const sharedMusicUrl = localMusicUrlChanged
     ? local.sharedMusicUrl
     : current.sharedMusicUrl ?? local.sharedMusicUrl ?? '';
+  const musicUrlChanged = localMusicUrlChanged || remoteMusicUrlChanged;
+  const sharedMusicPlaying = musicUrlChanged
+    ? false
+    : base.sharedMusicPlaying !== local.sharedMusicPlaying
+      ? Boolean(local.sharedMusicPlaying)
+      : Boolean(current.sharedMusicPlaying ?? local.sharedMusicPlaying);
+  const sharedMusicStartedAt = musicUrlChanged || !sharedMusicPlaying
+    ? 0
+    : base.sharedMusicStartedAt !== local.sharedMusicStartedAt
+      ? local.sharedMusicStartedAt
+      : current.sharedMusicStartedAt ?? local.sharedMusicStartedAt ?? 0;
   const aiDialogueCandidates = [current.aiDialogue, local.aiDialogue]
     .map(sanitizeFreezoneAIDialogue)
     .filter(Boolean);
@@ -403,10 +657,15 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   const aiHistory = Array.from(historyById.values())
     .sort((left, right) => left.createdAt - right.createdAt)
     .slice(-32);
+  const roomConfig = current.config ?? local.config ?? base.config;
 
   return {
     ...current,
     ...local,
+    ...(roomConfig ? {
+      config: roomConfig,
+      boardSize: roomConfig.boardSize ?? current.boardSize ?? local.boardSize ?? base.boardSize
+    } : {}),
     seats: mergedSeats,
     freezonePlayers: players,
     freezoneDepartures: departures,
@@ -421,6 +680,8 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       current.mutantZoneInitialized || local.mutantZoneInitialized
     ),
     sharedMusicUrl,
+    sharedMusicPlaying,
+    sharedMusicStartedAt,
     aiDialogue,
     aiHistory,
     eliminationRecords: Array.from(records.values())

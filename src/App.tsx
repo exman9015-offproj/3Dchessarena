@@ -14,6 +14,7 @@ type CreatorRoom = {
   capacity: number;
 };
 type FreezoneUpgrade = 'red' | 'blue' | 'yellow' | 'purple' | 'white';
+type FreezoneAllyRole = 'strategic' | 'offensive' | 'defensive' | 'guardian' | 'collector';
 type MultiplayerAction = () => Promise<MultiplayerResult> | undefined;
 type MultiplayerApi = {
   createMultiplayerRoom?: (color: 'w' | 'b') => Promise<MultiplayerResult>;
@@ -30,9 +31,21 @@ type MultiplayerApi = {
     pattern: Omit<FreezonePattern, 'id'> | FreezonePattern,
     replacementId?: string
   ) => Promise<{ ok: boolean; error?: string }>;
+  buyFreezoneAlly?: (role: FreezoneAllyRole) => Promise<{ ok: boolean; error?: string }>;
   upgradeFreezoneSkill?: (type: FreezoneUpgrade) => Promise<{ ok: boolean; error?: string }>;
   upgradeFreezoneEnvelope?: (rows: number, cols: number) => Promise<{ ok: boolean; error?: string }>;
+  unlockFreezoneMovement?: (
+    pieceId: string,
+    row: number,
+    col: number,
+    kind: 'drag' | 'jump' | 'teleport',
+    scopeRows: number,
+    scopeCols: number,
+    targetA: number
+  ) => Promise<{ ok: boolean; error?: string; addedOffset?: boolean }>;
+  setFreezoneBotsEnabled?: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
   setFreezoneSharedMusicUrl?: (url: string) => Promise<{ ok: boolean; error?: string }>;
+  setFreezoneSharedMusicPlaying?: (playing: boolean) => Promise<{ ok: boolean; error?: string }>;
   leaveCurrentGame?: () => void;
 };
 

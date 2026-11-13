@@ -16,8 +16,11 @@ import {
   updateFreezoneAISettings
 } from './freezoneAISettings.js';
 import {
+  FREEZONE_ENVELOPE_ORB_COST,
   FREEZONE_ENVELOPE_OPTIONS,
+  FREEZONE_MOVEMENT_ORB_COST,
   canUpgradeFreezoneEnvelope,
+  getFreezoneEnvelopeUpgradeCost,
   validateFreezoneAudioFile,
   validateFreezoneAudioUrl
 } from './freezoneRules.js';
@@ -36,6 +39,12 @@ type FreezoneRoom = {
   status: string;
   kind: string;
   name: string;
+  format?: string | null;
+  publication?: {
+    description: string;
+    thumbnailUrl: string;
+    tags: string[];
+  } | null;
   isMainArena: boolean;
   joined: number;
   capacity: number;
@@ -73,6 +82,8 @@ type FreezoneOwnedPiece = {
   moves: MoveOffset[];
   jumps: MoveOffset[];
   teleports: MoveOffset[];
+  unlockedMoves: MoveOffset[];
+  movementLimit: { rows: number; cols: number };
   slide: boolean;
   voiceLines: PieceVoiceLines;
   type: PieceType | 'king';
@@ -85,17 +96,20 @@ type FreezoneInspectedPiece = FreezoneOwnedPiece & {
 type FreezoneSpeechBubble = { text: string; x: number; y: number };
 
 type FreezoneOrbEffect = {
-  type: 'xp' | 'red' | 'blue' | 'yellow' | 'purple' | 'white';
+  type: 'xp' | 'red' | 'blue' | 'yellow' | 'purple' | 'white' | 'bot' | 'movement';
   label: string;
   description: string;
   color: string;
 };
-type FreezoneUpgrade = Exclude<FreezoneOrbEffect['type'], 'xp'>;
+type FreezoneUpgrade = Exclude<FreezoneOrbEffect['type'], 'xp' | 'bot' | 'movement'>;
+type FreezoneAllyRole = 'strategic' | 'offensive' | 'defensive' | 'guardian' | 'collector';
+type FreezoneAlly = { id: string; pieceId: string; name: string; role: FreezoneAllyRole };
 type FreezoneOnlinePlayer = {
   side: number;
   name: string;
   bot: boolean;
   online: true;
+  playing: boolean;
 };
 
 type FreezoneHud = {
@@ -118,9 +132,14 @@ type FreezoneHud = {
   stepsUsed: number;
   mutantZone?: { shape: 'diamond' | 'triangle' | 'circle'; remainingMs: number } | null;
   sharedMusicUrl?: string;
+  sharedMusicPlaying: boolean;
+  sharedMusicStartedAt: number;
   maxPatternOffsets: number;
   upgradeLevels: { red: number; blue: number; yellow: number; purple: number; white: number };
   orbBalances: Record<FreezoneOrbEffect['type'], number>;
+  allies: FreezoneAlly[];
+  alliedBots: Array<FreezoneAlly & { side: number; playing: boolean }>;
+  allyCost: number;
   canUpgrade: Record<FreezoneUpgrade, boolean>;
   ownedPieces: FreezoneOwnedPiece[];
   orbEffects: FreezoneOrbEffect[];
@@ -172,6 +191,20 @@ const FREEZONE_UPGRADES: { type: Exclude<FreezoneUpgrade, 'white'>; label: strin
   { type: 'yellow', label: 'Cooldown', description: 'Reduce rest by 0.3 seconds' },
   { type: 'purple', label: 'Army capacity', description: '+1 piece slot' }
 ];
+const FREEZONE_ALLY_LABELS: Record<FreezoneAllyRole, string> = {
+  strategic: 'Strategic',
+  offensive: 'Offensive',
+  defensive: 'Defensive',
+  guardian: 'Guardian',
+  collector: 'Orb collector'
+};
+const FREEZONE_ALLY_DESCRIPTIONS: Record<FreezoneAllyRole, string> = {
+  strategic: 'Balances valuable orbs, captures, and safe progress.',
+  offensive: 'Presses toward opponents and favors legal captures.',
+  defensive: 'Stays near your team and responds to nearby threats.',
+  guardian: 'Stays close to your king and moves to meet nearby threats.',
+  collector: 'Prioritizes bot orbs, then seeks other nearby orbs.'
+};
 
 function movementText(
   moves: MoveOffset[],
@@ -201,6 +234,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [rooms, setRooms] = useState<FreezoneRoom[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(false);
   const [notice, setNotice] = useState('');
+  const [radioOpen, setRadioOpen] = useState(false);
+  const [botsBusy, setBotsBusy] = useState(false);
+  const [allyRole, setAllyRole] = useState<FreezoneAllyRole>('strategic');
   const [designMode, setDesignMode] = useState(false);
   const [pieceType, setPieceType] = useState<PieceType>('knight');
   const [pieceName, setPieceName] = useState('');
@@ -237,11 +273,17 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [musicUrl, setMusicUrl] = useState(() => readLocalSetting('freezone-music-url'));
   const [musicVolume, setMusicVolume] = useState(readLocalVolume);
   const [musicPlaying, setMusicPlaying] = useState(false);
+  const [sharedMusicPlaying, setSharedMusicPlaying] = useState(false);
+  const [musicBusy, setMusicBusy] = useState(false);
   const [pendingReplacement, setPendingReplacement] = useState<FreezonePatternInput | null>(null);
   const [selectedMoves, setSelectedMoves] = useState<MoveOffset[]>([]);
   const [selectedJumps, setSelectedJumps] = useState<MoveOffset[]>([]);
   const [selectedTeleports, setSelectedTeleports] = useState<MoveOffset[]>([]);
-  const [targetEnvelope, setTargetEnvelope] = useState({ rows: 2, cols: 3 });
+  const [targetEnvelope, setTargetEnvelope] = useState({ rows: 1, cols: 2 });
+  const [targetMovementScope, setTargetMovementScope] = useState({ rows: 1, cols: 1 });
+  const [targetMovementA, setTargetMovementA] = useState(1);
+  const [selectedMovementPieceId, setSelectedMovementPieceId] = useState('');
+  const [movementKind, setMovementKind] = useState<'drag' | 'jump' | 'teleport'>('drag');
   const [slide, setSlide] = useState(false);
   const noticeTimer = useRef<number | null>(null);
   const musicRef = useRef<HTMLAudioElement | null>(null);
@@ -455,6 +497,31 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   }, [musicSource]);
 
   useEffect(() => {
+    const audio = musicRef.current;
+    if (!audio || !hud?.sharedMusicUrl || musicSource !== hud.sharedMusicUrl) return;
+    if (!sharedMusicPlaying) {
+      audio.pause();
+      return;
+    }
+    const seekToSharedPosition = () => {
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0 ||
+          !Number.isSafeInteger(hud.sharedMusicStartedAt)) return;
+      const elapsed = Math.max(0, (Date.now() - hud.sharedMusicStartedAt) / 1000);
+      audio.currentTime = elapsed % audio.duration;
+    };
+    if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      seekToSharedPosition();
+    } else {
+      audio.addEventListener('loadedmetadata', seekToSharedPosition, { once: true });
+    }
+    if (!audio.paused) return;
+    void audio.play().catch(() => {
+      setMusicPlaying(false);
+      setStatus('Shared music is on, but autoplay was blocked. Press “Enable audio here” to listen.');
+    });
+  }, [hud?.sharedMusicStartedAt, hud?.sharedMusicUrl, musicSource, sharedMusicPlaying]);
+
+  useEffect(() => {
     if (musicRef.current) musicRef.current.volume = musicVolume;
   }, [musicVolume]);
 
@@ -480,6 +547,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       if (enabled !== wasEnabled) setOpen(false);
       if (detail?.roomCode) setRoomCode(detail.roomCode);
       if (detail?.sharedMusicUrl !== undefined) setMusicUrl(detail.sharedMusicUrl);
+      if (detail?.sharedMusicPlaying !== undefined) {
+        setSharedMusicPlaying(detail.sharedMusicPlaying);
+      }
     };
     const handleOpenArena = () => {
       setStatus('');
@@ -493,9 +563,14 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       noticeTimer.current = window.setTimeout(() => setNotice(''), 3500);
     };
     const handleSharedMusic = (event: Event) => {
-      const url = (event as CustomEvent<string>).detail || '';
+      const detail = (event as CustomEvent<string | {
+        url?: string;
+        playing?: boolean;
+      }>).detail;
+      const url = typeof detail === 'string' ? detail : detail?.url || '';
       setMusicUrl(url);
-      if (!localMusicUrl.current) setMusicSource(url);
+      setMusicSource(url);
+      setSharedMusicPlaying(typeof detail === 'object' && detail?.playing === true);
     };
     window.addEventListener('wizard-chess-freezone-state', handleFreezoneState);
     window.addEventListener('wizard-chess-open-freezone', handleOpenArena);
@@ -589,6 +664,27 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         : choices[0] || current
     );
   }, [hud?.envelopeRows, hud?.envelopeCols]);
+
+  useEffect(() => {
+    if (!hud) return;
+    const piece = hud.ownedPieces.find((owned) => owned.id === selectedMovementPieceId) ||
+      hud.ownedPieces[0];
+    const maxRows = Math.min(hud.envelopeRows, piece?.movementLimit.rows || hud.envelopeRows);
+    const maxCols = Math.min(hud.envelopeCols, piece?.movementLimit.cols || hud.envelopeCols);
+    const scopes = FREEZONE_ENVELOPE_OPTIONS.filter((option) =>
+      option.rows <= maxRows && option.cols <= maxCols
+    );
+    setTargetMovementScope((current) =>
+      scopes.some((option) => option.rows === current.rows && option.cols === current.cols)
+        ? current
+        : scopes[scopes.length - 1] || { rows: 1, cols: 1 }
+    );
+    setSelectedMovementPieceId((current) =>
+      hud.ownedPieces.some((piece) => piece.id === current)
+        ? current
+        : hud.ownedPieces[0]?.id || ''
+    );
+  }, [hud?.envelopeRows, hud?.envelopeCols, hud?.ownedPieces, selectedMovementPieceId]);
 
   const createArena = async () => {
     const action = window.wizardChess?.createFreezoneRoom;
@@ -726,7 +822,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       }
       setMusicUrl(sharedUrl);
       setMusicSource(sharedUrl);
-      setStatus('Audio URL shared with the Freezone room. Each player must press Play.');
+      setStatus('Audio URL shared. Use “Play for room” to synchronize playback.');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not share this music URL with the room.');
     }
@@ -761,10 +857,57 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     setStatus('Local MP3 loaded. It is available only on this device and is not shared.');
   };
 
-  const toggleMusic = async () => {
+  const toggleMusic = async (source = musicSource) => {
     const audio = musicRef.current;
-    if (!audio || !musicSource) {
+    if (!audio || !source) {
       setStatus('Choose a local MP3 or load a direct audio URL first.');
+      return;
+    }
+    const localOnly = Boolean(localMusicUrl.current) && source === localMusicUrl.current;
+    if (hud?.sharedMusicUrl && !localOnly) {
+      const action = window.wizardChess?.setFreezoneSharedMusicPlaying;
+      if (!action) {
+        setStatus('Freezone is still starting. Try again in a moment.');
+        return;
+      }
+      if (sharedMusicPlaying && audio.paused) {
+        try {
+          await audio.play();
+        } catch {
+          setStatus('This browser could not play the shared audio. Check the URL and try again.');
+        }
+        return;
+      }
+      const nextPlaying = !sharedMusicPlaying;
+      setMusicBusy(true);
+      try {
+        if (nextPlaying && audio.src !== source) {
+          audio.src = source;
+          audio.load();
+        }
+        const change = action(nextPlaying);
+        const startPlayback = nextPlaying
+          ? audio.play().catch(() => {
+            setMusicPlaying(false);
+            setStatus('Music is playing for the room. Press “Enable audio here” if autoplay was blocked.');
+          })
+          : Promise.resolve();
+        const result = await change;
+        if (!result.ok) {
+          if (nextPlaying) audio.pause();
+          setStatus(result.error || 'Could not change shared music playback.');
+          return;
+        }
+        if (audio.src !== source) {
+          audio.src = source;
+          audio.load();
+        }
+        await startPlayback;
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Could not change shared music playback.');
+      } finally {
+        setMusicBusy(false);
+      }
       return;
     }
     if (!audio.paused) {
@@ -778,6 +921,43 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     } catch {
       setMusicPlaying(false);
       setStatus('The browser could not play this audio. Check the link/file and press Play again.');
+    }
+  };
+
+  const toggleBots = async (enabled: boolean) => {
+    const action = window.wizardChess?.setFreezoneBotsEnabled;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setBotsBusy(true);
+    try {
+      const result = await action(enabled);
+      if (!result.ok) setStatus(result.error || 'Could not change adversary bots.');
+      else setStatus(enabled ? 'Adversary bots joined available seats.' : 'Adversary bots removed.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not change adversary bots.');
+    } finally {
+      setBotsBusy(false);
+    }
+  };
+
+  const recruitAlly = async () => {
+    const action = window.wizardChess?.buyFreezoneAlly;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(allyRole);
+      setStatus(result.ok
+        ? `${FREEZONE_ALLY_LABELS[allyRole]} joined your team.`
+        : result.error || 'Could not recruit an allied bot.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not recruit an allied bot.');
+    } finally {
+      setPurchaseBusy(false);
     }
   };
 
@@ -848,6 +1028,38 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       )
     )
     : [];
+  const effectiveTargetEnvelope = upgradeableEnvelopes.some((option) =>
+    option.rows === targetEnvelope.rows && option.cols === targetEnvelope.cols
+  ) ? targetEnvelope : upgradeableEnvelopes[0] || targetEnvelope;
+  const targetEnvelopeCost = hud
+    ? getFreezoneEnvelopeUpgradeCost(
+      hud.envelopeRows,
+      hud.envelopeCols,
+      effectiveTargetEnvelope.rows,
+      effectiveTargetEnvelope.cols
+    )
+    : FREEZONE_ENVELOPE_ORB_COST;
+  const selectedMovementPiece = hud?.ownedPieces.find(
+    (piece) => piece.id === selectedMovementPieceId
+  );
+  const movementScopes = hud
+    ? FREEZONE_ENVELOPE_OPTIONS.filter((option) =>
+      option.rows <= Math.min(hud.envelopeRows, selectedMovementPiece?.movementLimit.rows || hud.envelopeRows) &&
+      option.cols <= Math.min(hud.envelopeCols, selectedMovementPiece?.movementLimit.cols || hud.envelopeCols)
+    )
+    : [];
+  const effectiveMovementScope = movementScopes.some((option) =>
+    option.rows === targetMovementScope.rows && option.cols === targetMovementScope.cols
+  ) ? targetMovementScope : movementScopes[0] || targetMovementScope;
+  const movementGridRows = effectiveMovementScope.rows * 2 + 1;
+  const movementGridCols = effectiveMovementScope.cols * 2 + 1;
+  const movementOffsetCount = selectedMovementPiece?.unlockedMoves.length || 0;
+  const movementOffsetKeys = new Set(
+    selectedMovementPiece?.moves.map(([row, col]) => `${row},${col}`) || []
+  );
+  const movementExtraKeys = new Set(
+    selectedMovementPiece?.unlockedMoves.map(([row, col]) => `${row},${col}`) || []
+  );
   const purchaseEnvelopeUpgrade = async () => {
     const action = window.wizardChess?.upgradeFreezoneEnvelope;
     if (!action) {
@@ -856,13 +1068,40 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
     setPurchaseBusy(true);
     try {
-      const result = await action(targetEnvelope.rows, targetEnvelope.cols);
+      const result = await action(effectiveTargetEnvelope.rows, effectiveTargetEnvelope.cols);
       setStatus(result.ok
-        ? `Movement envelope upgraded to ${targetEnvelope.rows}×${targetEnvelope.cols}.`
+        ? `Movement envelope upgraded to ${effectiveTargetEnvelope.rows}×${effectiveTargetEnvelope.cols}.`
         : result.error || 'Could not upgrade the movement envelope.');
       if (result.ok) emitTeamVoiceEvent('upgrade');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not upgrade the movement envelope.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  };
+  const purchaseMovementOffset = async (row: number, col: number) => {
+    const action = window.wizardChess?.unlockFreezoneMovement;
+    if (!action || !selectedMovementPiece) {
+      setStatus('Choose one of your pieces first.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(
+        selectedMovementPiece.id,
+        row,
+        col,
+        movementKind,
+        effectiveMovementScope.rows,
+        effectiveMovementScope.cols,
+        targetMovementA
+      );
+      setStatus(result.ok
+        ? `${movementKind} offset ${row}, ${col} ${result.addedOffset ? 'unlocked' : 'updated'} for ${selectedMovementPiece.name}.`
+        : result.error || 'Could not unlock this movement offset.');
+      if (result.ok) emitTeamVoiceEvent('upgrade');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not unlock this movement offset.');
     } finally {
       setPurchaseBusy(false);
     }
@@ -873,7 +1112,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       {!mainMenuOpen && hud?.enabled ? (
         <div className="freezone-hud" aria-live="polite">
           <span className="freezone-hud-stats">
-            XP {hud.xp} · Army {hud.pieces}/{hud.capacity}
+            XP {hud.xp} · Army {hud.pieces}/{hud.capacity} · Allied bots {hud.allies.length} · Bot orbs {hud.orbBalances.bot}
           </span>
           <span className="freezone-hud-player">
             {hud.playerName}{hud.selectedPieceName ? ` · Selected: ${hud.selectedPieceName}` : ''}
@@ -882,10 +1121,73 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
             <strong>Online {hud.onlinePlayers.length} · Max {hud.maxPlayers}</strong>
             {hud.onlinePlayers.map((player) => (
               <span key={player.side}>
-                {player.name} · Team {player.side + 1}{player.bot ? ' · Bot' : ''} · Online
+                {player.name} · Team {player.side + 1}{player.bot ? ' · Bot' : ''} · Online · {player.playing ? 'Playing' : 'Not playing'}
+              </span>
+            ))}
+            {hud.alliedBots.map((ally) => (
+              <span key={ally.id}>
+                {ally.name} · Team {ally.side + 1} · Allied bot · {FREEZONE_ALLY_LABELS[ally.role]} · {ally.playing ? 'Playing' : 'Not playing'}
               </span>
             ))}
           </div>
+          {roomCode && hud.isPlayer && (
+            <label className="freezone-hud-bots">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={hud.botsEnabled}
+                disabled={botsBusy}
+                onChange={(event) => void toggleBots(event.target.checked)}
+              />
+              <span>Adversary bots · {hud.onlinePlayers.filter((player) => player.bot).length}/2</span>
+            </label>
+          )}
+          <button
+            type="button"
+            className={`hud-btn freezone-radio-toggle ${sharedMusicPlaying ? 'playing' : ''}`}
+            aria-label="Configure shared Freezone radio"
+            aria-expanded={radioOpen}
+            onClick={() => {
+              setStatus('');
+              setRadioOpen((value) => !value);
+            }}
+          >
+            ♫ {sharedMusicPlaying ? 'On' : 'Radio'}
+          </button>
+          {radioOpen && (
+            <div className="freezone-radio-popover" role="group" aria-label="Shared room radio">
+              <label>
+                Shared radio / audio URL
+                <input
+                  value={musicUrl}
+                  maxLength={2048}
+                  placeholder="https://example.com/radio.mp3"
+                  onChange={(event) => setMusicUrl(event.target.value)}
+                />
+              </label>
+              <div>
+                <button type="button" onClick={() => void loadMusicUrl()}>Share URL</button>
+                {hud.sharedMusicUrl && (
+                  <button type="button" onClick={() => void clearSharedMusic()}>Clear</button>
+                )}
+                <button
+                  type="button"
+                  disabled={!hud.sharedMusicUrl || musicBusy}
+                  onClick={() => void toggleMusic(hud.sharedMusicUrl)}
+                >
+                  {sharedMusicPlaying
+                    ? musicPlaying ? 'Pause for room' : 'Enable audio here'
+                    : 'Play for room'}
+                </button>
+              </div>
+              <p>{hud.sharedMusicUrl
+                ? sharedMusicPlaying
+                  ? 'Room playback is on. A player may need to enable audio on their device.'
+                  : 'Room playback is paused.'
+                : 'No shared radio URL is configured.'}</p>
+              {status && <p role="status" aria-live="polite">{status}</p>}
+            </div>
+          )}
           <button
             type="button"
             className="hud-btn freezone-open"
@@ -921,15 +1223,19 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
           </button>
           <p className="freezone-eyebrow">SHARED REAL-TIME ARENA · UP TO 10 PLAYERS</p>
           <h2 id="freezone-title">{hud ? 'Freezone Piece Shop' : 'Freezone Arena'}</h2>
+          {status && <p className="freezone-hint" role="status" aria-live="polite">{status}</p>}
 
           {hud ? (
             <>
               <p className="freezone-description">
                 Landing on an orb stores that resource; pickups never change your skills automatically.
-                Spend XP to acquire a piece, or click an upgrade below to spend one matching colored orb.
+                Spend XP on regular pieces, colored orbs on upgrades, and green bot orbs to recruit allied bots.
+                Allied bots have their own pieces and do not take room seats or regular army slots.
               </p>
               <div className="freezone-summary">
                 <span><strong>{hud.xp}</strong> XP</span>
+                <span><strong>{hud.orbBalances.bot}</strong> bot orbs</span>
+                <span><strong>{hud.allies.length}</strong> allied bots</span>
                 <span><strong>{hud.pieces}/{hud.capacity}</strong> pieces</span>
                 <span><strong>{hud.xpCost}</strong> XP per piece</span>
                 <span>
@@ -958,23 +1264,17 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 <strong>Players online: {hud.onlinePlayers.length} · Maximum seats: {hud.maxPlayers}</strong>
                 {hud.onlinePlayers.length ? hud.onlinePlayers.map((player) => (
                   <span key={player.side}>
-                    Team {player.side + 1}: {player.name}{player.bot ? ' (Bot)' : ''} — Online
+                    Team {player.side + 1}: {player.name}{player.bot ? ' (Bot)' : ''} — Online · {player.playing ? 'Playing' : 'Not playing'}
                   </span>
                 )) : <span>No other players are online.</span>}
+                {hud.alliedBots.map((ally) => (
+                  <span key={ally.id}>
+                    Team {ally.side + 1}: {ally.name} (Allied bot · {FREEZONE_ALLY_LABELS[ally.role]}) — {ally.playing ? 'Playing' : 'Not playing'}
+                  </span>
+                ))}
               </div>
               {roomCode && hud.isPlayer && (
                 <div className="freezone-bot-controls">
-                  <button
-                    type="button"
-                    aria-pressed={hud.botsEnabled}
-                    onClick={() => window.dispatchEvent(new CustomEvent(
-                      'wizard-chess-freezone-toggle-bots',
-                      { detail: !hud.botsEnabled }
-                    ))}
-                  >
-                    Adversary bot: {hud.botsEnabled ? 'On' : 'Off'}
-                  </button>
-                  <span>Scripted locally; no AI API request. One bot uses an empty seat.</span>
                   <button
                     type="button"
                     aria-pressed={aiAssistEnabled}
@@ -984,6 +1284,42 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   </button>
                 </div>
               )}
+              <section className="freezone-allies" aria-label="Recruit allied bots">
+                <h3>Recruit a teammate bot · {hud.allyCost} bot orbs</h3>
+                <label>
+                  Bot role
+                  <select
+                    value={allyRole}
+                    onChange={(event) => setAllyRole(event.target.value as FreezoneAllyRole)}
+                    disabled={!hud.isPlayer || purchaseBusy}
+                  >
+                    {Object.entries(FREEZONE_ALLY_LABELS).map(([role, label]) => (
+                      <option key={role} value={role}>{label}</option>
+                    ))}
+                  </select>
+                </label>
+                <p>{FREEZONE_ALLY_DESCRIPTIONS[allyRole]}</p>
+                <button
+                  type="button"
+                  disabled={!hud.isPlayer || purchaseBusy ||
+                    hud.orbBalances.bot < hud.allyCost}
+                  onClick={() => void recruitAlly()}
+                >
+                  Recruit {FREEZONE_ALLY_LABELS[allyRole]} · {hud.allyCost} bot orbs
+                </button>
+                {hud.allies.length > 0 ? (
+                  <ul aria-label="Allied bots on your team">
+                    {hud.allies.map((ally) => (
+                      <li key={ally.id}>{ally.name} · {FREEZONE_ALLY_LABELS[ally.role]}</li>
+                    ))}
+                  </ul>
+                ) : <p>No allied bots recruited yet.</p>}
+                {hud.orbBalances.bot < hud.allyCost && (
+                  <p className="freezone-hint">
+                    Collect {hud.allyCost - hud.orbBalances.bot} more green bot orbs to recruit one.
+                  </p>
+                )}
+              </section>
               <div
                 className="freezone-xp-progress"
                 role="progressbar"
@@ -1029,7 +1365,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     <strong>{orb.label}</strong> {orb.description}
                     <small>
                       Balance: {hud.orbBalances[orb.type]}
-                      {orb.type !== 'xp' && ` · Lv ${hud.upgradeLevels[orb.type]}`}
+                      {orb.type !== 'xp' && orb.type !== 'bot' && orb.type !== 'movement' &&
+                        ` · Lv ${hud.upgradeLevels[orb.type]}`}
                     </small>
                   </span>
                 ))}
@@ -1055,10 +1392,10 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 <div className="freezone-upgrade">
                   <span>
                     <strong>Movement envelope</strong>
-                    <small>Choose the next grid size · costs 1 white orb · {hud.orbBalances.white} available</small>
+                    <small>Costs {FREEZONE_ENVELOPE_ORB_COST} white orbs per scope level · {hud.orbBalances.white} available</small>
                   </span>
                   <select
-                    value={`${targetEnvelope.rows}x${targetEnvelope.cols}`}
+                    value={`${effectiveTargetEnvelope.rows}x${effectiveTargetEnvelope.cols}`}
                     onChange={(event) => {
                       const [rows, cols] = event.target.value.split('x').map(Number);
                       setTargetEnvelope({ rows, cols });
@@ -1075,13 +1412,128 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   <button
                     type="button"
                     disabled={!hud.isPlayer || purchaseBusy || !upgradeableEnvelopes.length ||
-                      hud.orbBalances.white < 1}
+                      hud.orbBalances.white < targetEnvelopeCost}
                     onClick={() => void purchaseEnvelopeUpgrade()}
                   >
-                    {upgradeableEnvelopes.length ? 'Spend 1 white orb' : 'Max envelope'}
+                    {upgradeableEnvelopes.length
+                      ? `Spend ${targetEnvelopeCost} white orb${targetEnvelopeCost === 1 ? '' : 's'}`
+                      : 'Max envelope'}
                   </button>
                 </div>
               </div>
+              <section className="freezone-movement-shop" aria-label="Unlock piece movement cards">
+                <h3>Unlock movement cards · {FREEZONE_MOVEMENT_ORB_COST} movement orb each</h3>
+                <p className="freezone-hint">
+                  A counts only extra offsets bought for the selected piece. Its standard movements stay free.
+                  Changing an offset between drag, jump, and teleport replaces its type and does not increase A.
+                </p>
+                <div className="freezone-movement-controls">
+                  <label>
+                    Piece
+                    <select
+                      value={selectedMovementPieceId}
+                      onChange={(event) => setSelectedMovementPieceId(event.target.value)}
+                      disabled={!hud.isPlayer || purchaseBusy || !hud.ownedPieces.length}
+                    >
+                      {hud.ownedPieces.map((piece) => (
+                        <option key={piece.id} value={piece.id}>
+                          {piece.name} · {piece.type}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Scope
+                    <select
+                      value={`${effectiveMovementScope.rows}x${effectiveMovementScope.cols}`}
+                      onChange={(event) => {
+                        const [rows, cols] = event.target.value.split('x').map(Number);
+                        setTargetMovementScope({ rows, cols });
+                      }}
+                      disabled={!hud.isPlayer || purchaseBusy || !movementScopes.length}
+                    >
+                      {movementScopes.map((option) => (
+                        <option key={`${option.rows}x${option.cols}`} value={`${option.rows}x${option.cols}`}>
+                          {option.rows}×{option.cols}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Extra offsets (A)
+                    <select
+                      value={targetMovementA}
+                      onChange={(event) => setTargetMovementA(Number(event.target.value))}
+                      disabled={!hud.isPlayer || purchaseBusy}
+                    >
+                      {Array.from({ length: hud.maxPatternOffsets }, (_, index) => index + 1).map((count) => (
+                        <option key={count} value={count}>{count}A</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Card type
+                    <select
+                      value={movementKind}
+                      onChange={(event) => setMovementKind(event.target.value as typeof movementKind)}
+                      disabled={!hud.isPlayer || purchaseBusy}
+                    >
+                      <option value="drag">Drag / slide</option>
+                      <option value="jump">Jump</option>
+                      <option value="teleport">Teleport</option>
+                    </select>
+                  </label>
+                </div>
+                <p className="freezone-hint">
+                  {selectedMovementPiece
+                    ? `${selectedMovementPiece.name}: ${movementOffsetCount}A unlocked · target ${targetMovementA}A · ${hud.orbBalances.movement} movement orbs`
+                    : 'Acquire a piece to unlock movement cards.'}
+                </p>
+                {selectedMovementPiece && (
+                  <div
+                    className="freezone-movement-grid"
+                    role="group"
+                    aria-label={`${effectiveMovementScope.rows} by ${effectiveMovementScope.cols} movement cards`}
+                    style={{ gridTemplateColumns: `repeat(${movementGridCols}, minmax(0, 1fr))` }}
+                  >
+                    {Array.from({ length: movementGridRows * movementGridCols }, (_, index) => {
+                      const row = effectiveMovementScope.rows - Math.floor(index / movementGridCols);
+                      const col = index % movementGridCols - effectiveMovementScope.cols;
+                      const key = `${row},${col}`;
+                      const isCenter = row === 0 && col === 0;
+                      const alreadyAvailable = movementOffsetKeys.has(key);
+                      const isExtra = movementExtraKeys.has(key);
+                      const currentKind = selectedMovementPiece.teleports.some(
+                        ([moveRow, moveCol]) => moveRow === row && moveCol === col
+                      ) ? 'teleport' : selectedMovementPiece.jumps.some(
+                        ([moveRow, moveCol]) => moveRow === row && moveCol === col
+                      ) ? 'jump' : 'drag';
+                      const sameType = alreadyAvailable && currentKind === movementKind;
+                      const needsA = !alreadyAvailable;
+                      const canUnlock = hud.isPlayer && !purchaseBusy &&
+                        hud.orbBalances.movement >= FREEZONE_MOVEMENT_ORB_COST &&
+                        (!needsA || movementOffsetCount < targetMovementA) &&
+                        (!isCenter || movementKind === 'teleport') &&
+                        !sameType;
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          className={`freezone-movement-card ${isExtra ? 'extra' : ''} ${alreadyAvailable ? 'owned' : ''} ${movementKind}`}
+                          aria-label={`${isCenter ? 'Same-square' : `${row}, ${col}`} ${movementKind} movement${alreadyAvailable ? `; currently ${currentKind}` : ''}`}
+                          title={alreadyAvailable
+                            ? `${isExtra ? 'Extra offset' : 'Standard movement'} · ${currentKind}${sameType ? '' : ` · change to ${movementKind}`}`
+                            : `${movementKind} offset ${row}, ${col}`}
+                          disabled={!canUnlock}
+                          onClick={() => void purchaseMovementOffset(row, col)}
+                        >
+                          {sameType ? '✓' : alreadyAvailable ? '↻' : isCenter ? '0,0' : '+'}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
               <section className="freezone-customization" aria-label="Piece profile and local audio settings">
                 <h3>Piece appearance & profile</h3>
                 <div className="freezone-appearance-picker">
@@ -1301,8 +1753,16 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     </span>
                   </label>
                   <div className="freezone-music-controls">
-                    <button type="button" disabled={!musicSource} onClick={() => void toggleMusic()}>
-                      {musicPlaying ? 'Stop music' : 'Play music'}
+                    <button
+                      type="button"
+                      disabled={musicBusy || (!musicSource && !hud.sharedMusicUrl)}
+                      onClick={() => void toggleMusic(hud.sharedMusicUrl || musicSource)}
+                    >
+                      {hud.sharedMusicUrl
+                        ? sharedMusicPlaying
+                          ? musicPlaying ? 'Pause room music' : 'Enable audio here'
+                          : 'Play for room'
+                        : musicPlaying ? 'Stop local music' : 'Play local music'}
                     </button>
                     <label>
                       Volume
@@ -1320,7 +1780,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   />
                   <p className="freezone-hint">
                     {hud.sharedMusicUrl
-                      ? 'Shared URL is synchronized; each participant must press Play.'
+                    ? sharedMusicPlaying
+                      ? 'Shared playback is on; each participant may need to enable audio on their device.'
+                      : 'Shared URL is synchronized and playback is paused.'
                       : 'No shared URL is set. A local MP3 cannot be shared across devices.'}
                   </p>
                 </details>
@@ -1526,9 +1988,27 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 {!roomsLoading && !rooms.length && <p className="freezone-empty">No active Freezone rooms found.</p>}
                 {rooms.map((room) => (
                   <article className="freezone-room" key={room.id}>
+                    {room.publication?.thumbnailUrl && (
+                      <img
+                        className="freezone-room-thumbnail"
+                        src={room.publication.thumbnailUrl}
+                        alt=""
+                        loading="lazy"
+                      />
+                    )}
                     <div>
                       <strong>{room.name}{room.isMainArena ? ' · Main' : ''}</strong>
-                      <span>{room.joined} seats claimed · Maximum {room.capacity} · Code {room.code}</span>
+                      {room.publication?.description && <span>{room.publication.description}</span>}
+                      <span>
+                        {room.format === 'triangle' ? 'Triangle arena · ' : room.format === 'hexagonal' ? 'Hexagonal arena · ' : 'Square arena · '}
+                        {room.joined} seats claimed · {Math.max(0, room.capacity - room.joined)} slots available · Code {room.code}
+                      </span>
+                      {room.publication?.tags.length ? (
+                        <small className="freezone-room-tags">{room.publication.tags.join(' · ')}</small>
+                      ) : null}
+                      <small className="freezone-room-state">
+                        {room.status === 'active' ? 'In progress' : room.joined >= room.capacity ? 'Full' : 'Open'}
+                      </small>
                     </div>
                     <button
                       type="button"
